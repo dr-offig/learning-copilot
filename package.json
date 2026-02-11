@@ -1,0 +1,75 @@
+{
+  "name": "learning-copilot",
+  "publisher": "tgifford-usc",
+  "displayName": "learning-copilot",
+  "description": "AI code generator that scaffolds with learning experiences",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.109.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:learningCopilot.generateExercisePrompt",
+    "onCommand:learningCopilot.generateExerciseSelection",
+    "onCommand:learningCopilot.saveLastOutput",
+    "onCommand:learningCopilot.installCopilotCli"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "learningCopilot.generateExercisePrompt", "title": "Learning Copilot: Generate Exercise from Prompt" },
+      { "command": "learningCopilot.generateExerciseSelection", "title": "Learning Copilot: Generate Exercise from Selection" },
+      { "command": "learningCopilot.saveLastOutput", "title": "Learning Copilot: Save Last Output" },
+      { "command": "learningCopilot.installCopilotCli", "title": "Learning Copilot: Install/Setup Copilot CLI" }
+    ],
+    "configuration": {
+      "title": "Learning Copilot",
+      "properties": {
+        "learningCopilot.copilotPath": {
+          "type": "string",
+          "default": "copilot",
+          "description": "Path to Copilot CLI executable (e.g., 'copilot' on macOS, or 'C:\\\\Users\\\\you\\\\copilot.exe' on Windows lab machines)."
+        },
+        "learningCopilot.autoInstallCopilotCli": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true, Learning Copilot can offer to install Copilot CLI automatically when it is missing."
+        },
+        "learningCopilot.copilotArgs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Extra args passed to Copilot CLI."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "npm run check-types && npm run lint && node esbuild.js",
+    "watch": "npm-run-all -p watch:*",
+    "watch:esbuild": "node esbuild.js --watch",
+    "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
+    "package": "npm run check-types && npm run lint && node esbuild.js --production",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.109.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "22.x",
+    "typescript-eslint": "^8.54.0",
+    "eslint": "^9.39.2",
+    "esbuild": "^0.27.2",
+    "npm-run-all": "^4.1.5",
+    "typescript": "^5.9.3",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2"
+  }
+}
