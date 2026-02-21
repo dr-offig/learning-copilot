@@ -29,7 +29,8 @@
       { "command": "learningCopilot.applyNextBlank", "title": "Learning Copilot: Apply Solution For Next Blank" },
       { "command": "learningCopilot.showHintForBlankAtCursor", "title": "Learning Copilot: Show Hint For Blank At Cursor" },
       { "command": "learningCopilot.markBlankDoneAtCursor", "title": "Learning Copilot: Mark Blank As Done At Cursor" },
-      { "command": "learningCopilot.openLatestAnswerKey", "title": "Learning Copilot: Open Latest Answer Key" }
+      { "command": "learningCopilot.openLatestAnswerKey", "title": "Learning Copilot: Open Latest Answer Key" },
+      { "command": "learningCopilot.modifyWorkspaceFromPrompt", "title": "Learning Copilot: Modify Workspace From Prompt" }
     ],
     "configuration": {
       "title": "Learning Copilot",

@@ -740,7 +740,13 @@ function getExpectedMarkerLineRegexForPath(p: string, which: "START" | "END"): R
 }
 
 type ScaffoldValidationIssue = {
-  kind: "badCommentStyle" | "missingMarkers" | "missingBlankMapping" | "blankAlreadySolved" | "solutionNotFound";
+  kind:
+    | "badCommentStyle"
+    | "missingMarkers"
+    | "missingBlankMapping"
+    | "blankAlreadySolved"
+    | "solutionNotFound"
+    | "missingComprehensionAnswers";
   file?: string;
   id?: string;
   detail: string;
@@ -752,6 +758,27 @@ function extractRegionsForFile(content: string): BlankRegionHit[] {
 
 function extractRegionEditableText(content: string, r: BlankRegionHit): string {
   return content.slice(r.startTokenEnd, r.endTokenStart);
+}
+
+function extractComprehensionQuestionIds(exercisesMd: string): string[] {
+  // We require questions to be tagged like [CQ1], [CQ2], ...
+  const re = /\[CQ(\d+)\]/g;
+  const ids = new Set<string>();
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(exercisesMd))) {
+    ids.add(`CQ${m[1]}`);
+  }
+  return Array.from(ids).sort((a, b) => {
+    const na = Number(a.replace(/^CQ/, ""));
+    const nb = Number(b.replace(/^CQ/, ""));
+    return na - nb;
+  });
+}
+
+function answerKeyHasAnswerFor(questionId: string, answerKeyMd: string): boolean {
+  // Accept either an explicit tag line or a heading/bullet containing the tag.
+  const re = new RegExp(`\\[${escapeRegExp(questionId)}\\]`, "i");
+  return re.test(answerKeyMd);
 }
 
 function validateScaffoldPlan(plan: ScaffoldPlan): ScaffoldValidationIssue[] {
@@ -770,6 +797,46 @@ function validateScaffoldPlan(plan: ScaffoldPlan): ScaffoldValidationIssue[] {
     blanksByFileAndId.set(rel, m);
   }
 
+  // Build a quick index of blank regions present in maskedFiles content.
+  const regionsByFileAndId = new Map<string, Map<string, BlankRegionHit>>();
+  for (const mf of plan.maskedFiles) {
+    let rel: string;
+    try {
+      rel = normalizeRelativePath(mf.path);
+    } catch {
+      continue;
+    }
+    const regions = extractRegionsForFile(mf.content);
+    const m = regionsByFileAndId.get(rel) ?? new Map<string, BlankRegionHit>();
+    for (const r of regions) {
+      // If duplicate IDs exist, keep the first occurrence.
+      if (!m.has(r.id)) {
+        m.set(r.id, r);
+      }
+    }
+    regionsByFileAndId.set(rel, m);
+  }
+
+  // Ensure every blank entry actually appears in maskedFiles as a region.
+  for (const b of plan.blanks) {
+    let rel: string;
+    try {
+      rel = normalizeRelativePath(b.path);
+    } catch {
+      continue;
+    }
+    const rm = regionsByFileAndId.get(rel);
+    const hit = rm?.get(b.id);
+    if (!hit) {
+      issues.push({
+        kind: "missingMarkers",
+        file: rel,
+        id: b.id,
+        detail: `Blank ${b.id} is listed in plan.blanks for ${rel}, but no corresponding __LC_BLANK_${b.id}_START__/END markers were found in maskedFiles content for that file. Ensure the masked file includes the marker lines and placeholder between them.`,
+      });
+    }
+  }
+
   for (const mf of plan.maskedFiles) {
     let rel: string;
     try { rel = normalizeRelativePath(mf.path); }
@@ -780,7 +847,15 @@ function validateScaffoldPlan(plan: ScaffoldPlan): ScaffoldValidationIssue[] {
 
     const regions = extractRegionsForFile(mf.content);
     if (regions.length === 0) {
-      // It is allowed to have no blanks in some files, but often indicates a scaffold failure.
+      // If there are blanks declared for this file, then having no regions is invalid.
+      const declared = blanksByFileAndId.get(rel);
+      if (declared && declared.size > 0) {
+        issues.push({
+          kind: "missingMarkers",
+          file: rel,
+          detail: `maskedFiles contains ${rel} but no blank marker regions were found, even though plan.blanks declares ${declared.size} blank(s) for this file. Add proper START/END marker lines and placeholder content.`,
+        });
+      }
       continue;
     }
 
@@ -822,6 +897,25 @@ function validateScaffoldPlan(plan: ScaffoldPlan): ScaffoldValidationIssue[] {
     }
   }
 
+  // Validate that answerKeyMd includes answers for comprehension questions.
+  const cqIds = extractComprehensionQuestionIds(plan.exercisesMd);
+  if (cqIds.length > 0) {
+    const ak = (plan.answerKeyMd ?? "").trim();
+    if (!ak) {
+      issues.push({
+        kind: "missingComprehensionAnswers",
+        detail: `exercisesMd contains ${cqIds.length} comprehension question tag(s) (${cqIds.join(", ")}), but answerKeyMd is missing or empty. Provide answers for every [CQn] question.`,
+      });
+    } else {
+      const missing = cqIds.filter((id) => !answerKeyHasAnswerFor(id, ak));
+      if (missing.length > 0) {
+        issues.push({
+          kind: "missingComprehensionAnswers",
+          detail: `answerKeyMd is missing answers for comprehension question tag(s): ${missing.join(", ")}. Include a clearly labeled answer section that repeats each tag like [CQ1] and provides its answer.`,
+        });
+      }
+    }
+  }
   return issues;
 }
 
@@ -928,6 +1022,101 @@ async function pickSaveUri(context: vscode.ExtensionContext): Promise<vscode.Uri
   // Fallback to extension storage (always writable in user profile)
   await vscode.workspace.fs.createDirectory(context.globalStorageUri);
   return vscode.Uri.joinPath(context.globalStorageUri, "exercise.md");
+}
+
+/**
+ * Returns a conservative exclude glob for scanning a workspace.
+ */
+function getWorkspaceScanExcludeGlob(): string {
+  // Exclude common large/vendor/build folders and VCS metadata.
+  return "**/{node_modules,.git,.svn,.hg,dist,build,out,target,bin,obj,coverage,.next,.nuxt,.svelte-kit,.parcel-cache,.turbo,.cache,vendor}/**";
+}
+
+/**
+ * Best-effort heuristic to decide if a file is text.
+ */
+function looksLikeText(buf: Uint8Array): boolean {
+  // If it contains NUL, treat as binary.
+  for (let i = 0; i < buf.length; i++) {
+    if (buf[i] === 0) {return false;}
+  }
+  return true;
+}
+
+type WorkspaceFileContext = { path: string; content: string; truncated?: boolean };
+
+/**
+ * Collects a limited snapshot of workspace files to provide Copilot with context.
+ * - Excludes large/build/vendor folders
+ * - Skips very large files
+ * - Truncates per-file content and total payload size
+ */
+async function collectWorkspaceContext(wsRoot: vscode.Uri, output: vscode.OutputChannel): Promise<WorkspaceFileContext[]> {
+  const MAX_FILES = 80;
+  const MAX_BYTES_PER_FILE = 40_000; // ~40KB
+  const MAX_TOTAL_CHARS = 220_000;   // keep prompt reasonable
+
+  const exclude = getWorkspaceScanExcludeGlob();
+  const uris = await vscode.workspace.findFiles("**/*", exclude, MAX_FILES);
+
+  const results: WorkspaceFileContext[] = [];
+  let totalChars = 0;
+
+  for (const uri of uris) {
+    // Skip directories just in case (findFiles should return files)
+    if (uri.scheme !== "file") {continue;}
+
+    const rel = path.relative(wsRoot.fsPath, uri.fsPath).replace(/\\/g, "/");
+    let safeRel: string;
+    try {
+      safeRel = normalizeRelativePath(rel);
+    } catch {
+      continue;
+    }
+
+    // Skip common binary extensions
+    const ext = path.posix.extname(safeRel.toLowerCase());
+    if ([
+      ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".tgz", ".7z", ".rar",
+      ".mp3", ".mp4", ".mov", ".wav", ".aif", ".aiff", ".flac", ".ogg", ".bin", ".exe", ".dylib", ".so", ".dll"
+    ].includes(ext)) {
+      continue;
+    }
+
+    let fileBytes: Uint8Array;
+    try {
+      fileBytes = await vscode.workspace.fs.readFile(uri);
+    } catch {
+      continue;
+    }
+
+    if (fileBytes.byteLength > 600_000) {
+      // Too big for prompt context
+      continue;
+    }
+
+    if (!looksLikeText(fileBytes)) {
+      continue;
+    }
+
+    let text = Buffer.from(fileBytes).toString("utf8");
+    let truncated = false;
+    if (text.length > MAX_BYTES_PER_FILE) {
+      text = text.slice(0, MAX_BYTES_PER_FILE) + "\n\n/* TRUNCATED */\n";
+      truncated = true;
+    }
+
+    // Enforce total cap
+    if (totalChars + text.length > MAX_TOTAL_CHARS) {
+      output.appendLine(`Workspace context cap reached; stopping at ${results.length} files.`);
+      break;
+    }
+
+    results.push({ path: safeRel, content: text, truncated });
+    totalChars += text.length;
+  }
+
+  return results;
 }
 
 //#endregion
@@ -1069,6 +1258,94 @@ async function saveSolutionSnapshot(storageDir: string, written: WrittenFile[]):
   return root;
 }
 
+type ScaffoldContextFile = { path: string; content: string };
+
+type LineRange = { startLine: number; endLine: number }; // 1-based inclusive
+
+type FocusFileWithDiff = {
+  rel: string;
+  fullContent: string;
+  oldContent: string;
+  changedRanges: LineRange[];
+};
+
+// Simple prefix/suffix heuristic. Works well for typical “edit a section” changes.
+// If you need multiple hunks later, we can upgrade to a real diff.
+function computeChangedRangesByPrefixSuffix(oldText: string, newText: string): LineRange[] {
+  const oldLines = oldText.split(/\r?\n/);
+  const newLines = newText.split(/\r?\n/);
+
+  let start = 0;
+  while (start < oldLines.length && start < newLines.length && oldLines[start] === newLines[start]) {
+    start++;
+  }
+
+  let oldEnd = oldLines.length - 1;
+  let newEnd = newLines.length - 1;
+  while (oldEnd >= start && newEnd >= start && oldLines[oldEnd] === newLines[newEnd]) {
+    oldEnd--;
+    newEnd--;
+  }
+
+  // No changes
+  if (start > oldEnd && start > newEnd) {return [];}
+
+  return [{ startLine: start + 1, endLine: newEnd + 1 }];
+}
+
+function formatRangesForPrompt(ranges: LineRange[]): string {
+  return ranges.length ? ranges.map(r => `L${r.startLine}-L${r.endLine}`).join(", ") : "(no changes detected)";
+}
+
+function getRegionStartLine(docText: string, startTokenStart: number): number {
+  return docText.slice(0, startTokenStart).split(/\r?\n/).length; // 1-based
+}
+
+function isLineWithinRanges(line: number, ranges: LineRange[]): boolean {
+  if (!ranges.length) {return false;} // if we detect no changes, don't allow blanks
+  return ranges.some(r => line >= r.startLine && line <= r.endLine);
+}
+
+
+function buildScaffoldContextFromWorkspaceSnapshot(
+  wsSnapshot: WorkspaceFileContext[],
+  changed: WrittenFile[],
+  output: vscode.OutputChannel
+): ScaffoldContextFile[] {
+  // Start with the collected workspace snapshot, then overwrite entries for changed files
+  // with the newly-written content so context matches what is on disk after modifications.
+  const map = new Map<string, string>();
+
+  for (const f of wsSnapshot) {
+    try {
+      const rel = normalizeRelativePath(f.path);
+      map.set(rel, f.content);
+    } catch {
+      // ignore
+    }
+  }
+
+  for (const w of changed) {
+    try {
+      const rel = normalizeRelativePath(w.rel);
+      map.set(rel, w.fullContent);
+    } catch {
+      // ignore
+    }
+  }
+
+  const outArr: ScaffoldContextFile[] = [];
+  for (const [pathRel, content] of map.entries()) {
+    outArr.push({ path: pathRel, content });
+  }
+
+  // Keep stable order for determinism
+  outArr.sort((a, b) => a.path.localeCompare(b.path));
+
+  output.appendLine(`Scaffold context prepared: ${outArr.length} file(s) total (includes updated changed files).`);
+  return outArr;
+}
+
 async function generateLearningScaffold(
   written: WrittenFile[],
   storageDir: string,
@@ -1120,8 +1397,10 @@ async function generateLearningScaffold(
     // ---- end inserted ----
     "(6) 'hint' should guide the student without revealing the solution. " +
     "(7) 'explanation' should briefly explain what the solution does and why it is correct. " +
-    "(8) exercisesMd must reference the entire project, explicitly refer to blank IDs, and include at least 5 conceptual/comprehension questions about the project architecture and logic. " +
-    "(9) answerKeyMd must be an INSTRUCTOR KEY that includes: (a) each blank with its id, path, solution, and explanation; and (b) ANSWERS to every comprehension question in exercisesMd, matching the same numbering/headings so they can be cross-referenced. " +
+    "(8) exercisesMd must reference the entire project, explicitly refer to blank IDs, and include a section titled 'Comprehension Questions'. " +
+    "In that section, include at least 5 questions, EACH tagged with a stable identifier like [CQ1], [CQ2], ... (include the tag literally in the question line). " +
+    "(9) answerKeyMd must be an INSTRUCTOR KEY that includes: (a) each blank with its id, path, solution, and explanation; and (b) a section titled 'Comprehension Answers' that answers EVERY comprehension question. " +
+    "Each answer MUST repeat the same tag, e.g. '[CQ1] ...answer...'. " +
     "(10) Do NOT remove import statements, package declarations, or file-level boilerplate unless pedagogically critical." +
     "Input files (JSON array): " +
     JSON.stringify(filePayload);
@@ -1166,6 +1445,7 @@ async function generateLearningScaffold(
       "- Markers must be on their own lines and contain only the token + comment delimiters. " +
       "- Placeholder between markers must NOT equal the solution; it must be incomplete so the student must edit. " +
       "- maskedFiles may only include input paths. " +
+      "- exercisesMd must include comprehension questions tagged [CQ1].. and answerKeyMd must include a 'Comprehension Answers' section with matching tags. " +
       "Input files (JSON array): " +
       JSON.stringify(filePayload);
 
@@ -1197,6 +1477,171 @@ async function generateLearningScaffold(
     }
 
     output.appendLine("\n--- Scaffold repair succeeded. ---");
+    return repaired;
+  }
+
+  return parsed;
+}
+
+async function generateLearningScaffoldFocused(
+  focusFiles: FocusFileWithDiff[],
+  contextFiles: ScaffoldContextFile[],
+  storageDir: string,
+  copilotPath: string,
+  copilotArgs: string[],
+  configDir: string,
+  logDir: string,
+  output: vscode.OutputChannel,
+  envOverride: NodeJS.ProcessEnv
+): Promise<ScaffoldPlan> {
+  const MAX_CHARS_PER_FILE = 12000;
+
+  const focusPayload = focusFiles.map((f) => ({
+    path: f.rel,
+    changedRanges: f.changedRanges,
+    changedRangesHuman: formatRangesForPrompt(f.changedRanges),
+    content:
+      f.fullContent.length > MAX_CHARS_PER_FILE
+        ? f.fullContent.slice(0, MAX_CHARS_PER_FILE) + "\n\n/* TRUNCATED */\n"
+        : f.fullContent,
+    oldContent:
+      f.oldContent.length > MAX_CHARS_PER_FILE
+        ? f.oldContent.slice(0, MAX_CHARS_PER_FILE) + "\n\n/* TRUNCATED */\n"
+        : f.oldContent,
+  }));
+
+  const contextPayload = contextFiles.map((f) => ({
+    path: f.path,
+    content:
+      f.content.length > MAX_CHARS_PER_FILE
+        ? f.content.slice(0, MAX_CHARS_PER_FILE) + "\n\n/* TRUNCATED */\n"
+        : f.content,
+  }));
+
+  const scaffoldPrompt =
+    "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
+    "You are a teaching assistant. Create a LEARNING SCAFFOLD focused ONLY on the NEW or MODIFIED functionality. " +
+    "You will be given (A) focusFiles: the files that were created/changed, and (B) contextFiles: the broader workspace for reference. " +
+    "Output schema: " +
+    "{\"maskedFiles\":[{\"path\":string,\"content\":string}]," +
+    "\"blanks\":[{\"id\":string,\"path\":string,\"solution\":string,\"hint\":string?,\"explanation\":string?}]," +
+    "\"exercisesMd\":string,\"answerKeyMd\":string?,\"notes\":string?}. " +
+    "STRICT RULES: " +
+    "(1) maskedFiles MUST include ONLY files listed in focusFiles (same paths). Do NOT include other files in maskedFiles. " +
+    "(2) Blanks MUST appear ONLY in focusFiles. Do NOT add blanks to other files. " +
+    "(3) CRITICAL: Each focus file includes 'changedRanges' (line ranges in the NEW content). You MUST place blank regions ONLY within these changedRanges. Do NOT place blanks outside changedRanges. " +
+    "(4) Replace about 5–15% of IMPORTANT logic related to the new/modified functionality with blank REGIONS that remain identifiable after the student edits. " +
+    "Each blank region MUST be wrapped by two exact tokens: __LC_BLANK_<id>_START__ and __LC_BLANK_<id>_END__. " +
+    "The student-editable placeholder content must appear BETWEEN these two tokens. " +
+    "Markers MUST appear on their own lines as standalone comments containing only the token (plus comment delimiters). Do not place marker tokens inline with code. " +
+    "(5) Every blank region MUST have a corresponding entry in the 'blanks' array. " +
+    "(6) 'solution' must be ONLY the replacement code between markers (no tokens). " +
+    "(7) COMMENT STYLE for marker lines must match file type (HTML uses <!-- -->, CSS uses /* */, JS uses // or /* */, Python uses #). " +
+    "(8) Placeholder between markers MUST be incomplete/incorrect compared to solution. " +
+    "(9) exercisesMd must focus on the new/modified functionality, reference blank IDs, and include a section titled 'Comprehension Questions'. " +
+    "In that section, include at least 5 questions, EACH tagged with a stable identifier like [CQ1], [CQ2], ... (include the tag literally in the question line). " +
+    "(10) answerKeyMd must include: (a) each blank (id/path/solution/explanation) and (b) a section titled 'Comprehension Answers' that answers EVERY comprehension question. " +
+    "Each answer MUST repeat the same tag, e.g. '[CQ1] ...answer...'. " +
+    "(11) IMPORTANT: If changedRanges is empty for a file, do not place blanks in that file. " +
+    "Focus files (JSON array): " +
+    JSON.stringify(focusPayload) +
+    "\n\nContext files (JSON array): " +
+    JSON.stringify(contextPayload);
+
+  const res = await runCopilotPrompt(
+    copilotPath,
+    copilotArgs,
+    storageDir,
+    scaffoldPrompt,
+    configDir,
+    logDir,
+    output,
+    envOverride
+  );
+
+  const stderr = res.stderr.trim();
+  const stdout = res.stdout.trim();
+
+  if (res.exitCode !== 0) {
+    throw new Error(stderr || `Copilot scaffold generation failed (exit ${res.exitCode}).`);
+  }
+  if (!stdout) {
+    throw new Error("Copilot scaffold generation returned empty stdout.");
+  }
+
+  const parsed = parseScaffoldPlan(stdout);
+  const issues = validateScaffoldPlan(parsed);
+
+  // Additional focused validation: blank regions must start within changedRanges.
+  const byRel = new Map<string, FocusFileWithDiff>();
+  for (const f of focusFiles) { byRel.set(normalizeRelativePath(f.rel), f); }
+
+  for (const mf of parsed.maskedFiles) {
+    let rel: string;
+    try { rel = normalizeRelativePath(mf.path); } catch { continue; }
+
+    const meta = byRel.get(rel);
+    if (!meta) {continue;}
+
+    const regions = listBlankRegions(mf.content);
+    for (const r of regions) {
+      const startLine = getRegionStartLine(mf.content, r.startTokenStart);
+      if (!isLineWithinRanges(startLine, meta.changedRanges)) {
+        issues.push({
+          kind: "blankAlreadySolved" as any, // reuse an issue kind to force repair
+          file: rel,
+          id: r.id,
+          detail: `Blank ${r.id} starts at line ${startLine} in ${rel}, OUTSIDE changedRanges ${formatRangesForPrompt(meta.changedRanges)}. Move blanks inside changedRanges only.`,
+        });
+      }
+    }
+  }
+
+  if (issues.length > 0) {
+    output.appendLine("\n--- Focused scaffold validation issues detected; attempting one repair pass ---");
+    output.appendLine(formatScaffoldIssuesForPrompt(issues));
+
+    const repairPrompt =
+      "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
+      "You previously produced an invalid focused learning scaffold. Fix it. " +
+      "Output schema MUST remain: {\"maskedFiles\":[{\"path\":string,\"content\":string}],\"blanks\":[{\"id\":string,\"path\":string,\"solution\":string,\"hint\":string?,\"explanation\":string?}],\"exercisesMd\":string,\"answerKeyMd\":string?,\"notes\":string?}. " +
+      "Fix ALL of these validation issues:\n" +
+      formatScaffoldIssuesForPrompt(issues) +
+      "\n\nRules: maskedFiles/blanks must stay restricted to focusFiles. Use correct marker comment style. Placeholder must differ from solution. " +
+      "- exercisesMd must include comprehension questions tagged [CQ1].. and answerKeyMd must include a 'Comprehension Answers' section with matching tags. " +
+      "Focus files (JSON array): " +
+      JSON.stringify(focusPayload) +
+      "\n\nContext files (JSON array): " +
+      JSON.stringify(contextPayload);
+
+    const repairRes = await runCopilotPrompt(
+      copilotPath,
+      copilotArgs,
+      storageDir,
+      repairPrompt,
+      configDir,
+      logDir,
+      output,
+      envOverride
+    );
+
+    const repairStdout = repairRes.stdout.trim();
+    if (repairRes.exitCode !== 0) {
+      throw new Error(repairRes.stderr.trim() || `Copilot scaffold repair failed (exit ${repairRes.exitCode}).`);
+    }
+    if (!repairStdout) {
+      throw new Error("Copilot scaffold repair returned empty stdout.");
+    }
+
+    const repaired = parseScaffoldPlan(repairStdout);
+    const issues2 = validateScaffoldPlan(repaired);
+    if (issues2.length > 0) {
+      output.appendLine("\n--- Focused scaffold repair still has issues (returning repaired output anyway). ---");
+      output.appendLine(formatScaffoldIssuesForPrompt(issues2));
+      return repaired;
+    }
+
+    output.appendLine("\n--- Focused scaffold repair succeeded. ---");
     return repaired;
   }
 
@@ -2104,9 +2549,310 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
+   // Modify / extend existing workspace from prompt (uses workspace context)
+  context.subscriptions.push(
+    vscode.commands.registerCommand("learningCopilot.modifyWorkspaceFromPrompt", async () => {
+      const wsRoot = getWorkspaceRootUri();
+      if (!wsRoot) {
+        vscode.window.showErrorMessage("Open a folder/workspace first.");
+        return;
+      }
+
+      const { copilotPath, copilotArgs } = getConfig();
+      const storageDir = await ensureStorageDir(context);
+      const logDir = getCopilotLogDir(storageDir);
+      const configDir = getCopilotConfigDir(storageDir);
+      await fsp.mkdir(logDir, { recursive: true });
+      await fsp.mkdir(configDir, { recursive: true });
+
+      const userPrompt = await vscode.window.showInputBox({
+        title: "Learning Copilot: Modify workspace",
+        placeHolder: "e.g., Add a dark mode toggle; add form validation; refactor into modules; add an API route; etc.",
+      });
+      if (!userPrompt) {return;}
+
+      output.show(true);
+
+      // Gather workspace context
+      output.appendLine("\n=== Collecting workspace context ===");
+      const ctxFiles = await collectWorkspaceContext(wsRoot, output);
+      output.appendLine(`Collected ${ctxFiles.length} file(s) for context.`);
+
+      // Also include active file hint (if any)
+      const active = vscode.window.activeTextEditor?.document?.uri;
+      let activeRel: string | null = null;
+      if (active && active.scheme === "file") {
+        try {
+          activeRel = getRelPathForActiveDoc(wsRoot, active);
+        } catch {
+          activeRel = null;
+        }
+      }
+
+      const token = await getVsCodeGitHubToken();
+      const envOverride: NodeJS.ProcessEnv = token
+        ? { COPILOT_GITHUB_TOKEN: token, GH_TOKEN: token, GITHUB_TOKEN: token }
+        : {};
+
+      const planPrompt =
+        "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
+        'Schema: {"files":[{"path":string,"content":string,"overwrite":boolean?}],"notes":string?}. ' +
+        "You are modifying an EXISTING codebase. Use the provided workspace files as context. " +
+        "Only include files that need to be created or changed. Do not include unchanged files. " +
+        "All paths must be relative to the workspace root and must not contain '..' or start with '/'. " +
+        "If you need a new file, add it. If you modify a file, output its FULL new content. " +
+        "Avoid large dependencies; prefer small, direct changes. " +
+        (activeRel ? `The user's active file is: ${activeRel}. ` : "") +
+        "Workspace files (JSON array of {path,content}): " +
+        JSON.stringify(ctxFiles) +
+        "\n\nTask: " +
+        userPrompt;
+
+      const res = await runCopilotPrompt(
+        copilotPath,
+        copilotArgs,
+        storageDir,
+        planPrompt,
+        configDir,
+        logDir,
+        output,
+        envOverride
+      );
+
+      const stderr = res.stderr.trim();
+      const stdout = res.stdout.trim();
+
+      if (res.exitCode !== 0) {
+        if (stderr.toLowerCase().includes("no authentication information found")) {
+          const choice = await vscode.window.showErrorMessage(
+            "Copilot CLI is installed but not logged in. Open a terminal to run /login now?",
+            "Login",
+            "Cancel"
+          );
+          if (choice === "Login") {
+            await vscode.commands.executeCommand("learningCopilot.loginCopilotCli");
+          }
+          return;
+        }
+        vscode.window.showErrorMessage(`Copilot CLI failed (exit ${res.exitCode}). See Output for details.`);
+        if (stderr) {
+          output.appendLine("--- stderr ---");
+          output.appendLine(stderr);
+        }
+        return;
+      }
+
+      if (!stdout) {
+        vscode.window.showErrorMessage("Copilot returned empty stdout.");
+        return;
+      }
+
+      let plan: { files: Array<{ path: string; content: string; overwrite?: boolean }>; notes?: string };
+      try {
+        plan = parseFilePlan(stdout);
+      } catch (e: any) {
+        output.appendLine("--- raw stdout ---");
+        output.appendLine(stdout);
+        vscode.window.showErrorMessage(e?.message ?? String(e));
+        return;
+      }
+
+      if (plan.notes) {
+        output.appendLine("--- notes ---");
+        output.appendLine(plan.notes);
+      }
+
+      if (!plan.files?.length) {
+        vscode.window.showInformationMessage("Copilot did not propose any file changes.");
+        return;
+      }
+
+      const writtenFiles: WrittenFile[] = [];
+      const oldContentByRel = new Map<string, string>();
+
+      for (const f of plan.files) {
+        let rel: string;
+        try {
+          rel = normalizeRelativePath(f.path);
+        } catch (e: any) {
+          vscode.window.showErrorMessage(e?.message ?? String(e));
+          continue;
+        }
+
+        const targetUri = vscode.Uri.joinPath(wsRoot, ...rel.split("/"));
+        const exists = await vscode.workspace.fs.stat(targetUri).then(() => true, () => false);
+
+        const proposedKey = `proposed/${rel}`;
+        proposedContent.set(proposedKey, f.content);
+        const proposedUri = vscode.Uri.parse(`${PROPOSED_SCHEME}:/${proposedKey}`);
+
+        const title = exists ? `Apply change: ${rel} (overwrite existing?)` : `Apply change: ${rel} (create?)`;
+
+        while (true) {
+          const pick = await vscode.window.showInformationMessage(
+            title,
+            { modal: true },
+            "Preview",
+            exists ? "Overwrite" : "Create",
+            "Skip"
+          );
+
+          if (!pick || pick === "Skip") {break;}
+
+          if (pick === "Preview") {
+            if (exists) {
+              await vscode.commands.executeCommand("vscode.diff", targetUri, proposedUri, `Proposed change: ${rel}`);
+            } else {
+              const emptyKey = `empty/${rel}`;
+              proposedContent.set(emptyKey, "");
+              const emptyUri = vscode.Uri.parse(`${PROPOSED_SCHEME}:/${emptyKey}`);
+              await vscode.commands.executeCommand("vscode.diff", emptyUri, proposedUri, `Proposed new file: ${rel}`);
+            }
+            continue;
+          }
+
+          if (pick === "Overwrite" || pick === "Create") {
+            // make note of the old content before overwriting, so we can use it as context for focused scaffold generation later
+            if (exists) {
+              try {
+                const oldBytes = await vscode.workspace.fs.readFile(targetUri);
+                oldContentByRel.set(rel, Buffer.from(oldBytes).toString("utf8"));
+              } catch {
+                oldContentByRel.set(rel, "");
+              }
+            } else {
+              oldContentByRel.set(rel, "");
+            }
+            
+            // now overwrite (or create) the file with the new content
+            await ensureDirForFile(targetUri);
+            await vscode.workspace.fs.writeFile(targetUri, Buffer.from(f.content, "utf8"));
+            writtenFiles.push({ rel, fullContent: f.content });
+            vscode.window.showInformationMessage(`${exists ? "Updated" : "Created"}: ${rel}`);
+            break;
+          }
+        }
+      }
+
+      if (!writtenFiles.length) {
+        vscode.window.showInformationMessage("No changes applied.");
+        return;
+      }
+
+      vscode.window.showInformationMessage(`Applied ${writtenFiles.length} change(s).`);
+
+   // Optional: offer scaffold generation for the changed files
+   const doScaffold = await vscode.window.showInformationMessage(
+     `Generate learning scaffold (blanks + exercises) for the ${writtenFiles.length} changed file(s)?`,
+     { modal: true },
+     "Generate",
+     "Skip"
+   );
+   if (doScaffold !== "Generate") {return;}
+
+   // Save full solution snapshot of the changed files (private)
+   let snapshotDir: string | null = null;
+   try {
+     snapshotDir = await saveSolutionSnapshot(storageDir, writtenFiles);
+     await context.globalState.update("learningCopilot.lastSnapshotDir", snapshotDir);
+   } catch (e: any) {
+     output.appendLine(`Failed to save solution snapshot: ${e?.message ?? String(e)}`);
+   }
+
+   output.appendLine("\n=== Generating learning scaffold (focused on new/changed functionality) ===");
+
+   const scaffoldContext = buildScaffoldContextFromWorkspaceSnapshot(ctxFiles, writtenFiles, output);
+
+   let scaffold: ScaffoldPlan;
+
+   // get a handle on the changed files with their old content, so we can prompt for a focused scaffold generation that only blanks out the new/changed lines instead of the entire file    
+   const focusWithDiff: FocusFileWithDiff[] = writtenFiles.map((wf) => {
+    const rel = normalizeRelativePath(wf.rel);
+    const oldContent = oldContentByRel.get(rel) ?? "";
+    return {
+      rel,
+      fullContent: wf.fullContent,
+      oldContent,
+      changedRanges: computeChangedRangesByPrefixSuffix(oldContent, wf.fullContent),
+    };
+  });
+  
+  try {
+     scaffold = await generateLearningScaffoldFocused(
+       focusWithDiff,
+       scaffoldContext,
+       storageDir,
+       copilotPath,
+       copilotArgs,
+       configDir,
+       logDir,
+       output,
+       envOverride
+     );
+   } catch (e: any) {
+     vscode.window.showErrorMessage(`Failed to generate learning scaffold: ${e?.message ?? String(e)}`);
+     return;
+   }
+
+   await context.globalState.update("learningCopilot.lastScaffoldBlanks", scaffold.blanks);
+
+   // Apply masked files only to the files we just changed (auto-overwrite)
+   const changedSet = new Set(writtenFiles.map((w) => normalizeRelativePath(w.rel)));
+   const maskedToApply = scaffold.maskedFiles
+     .map((mf) => {
+       try {
+         return { rel: normalizeRelativePath(mf.path), content: mf.content };
+       } catch {
+         return null;
+       }
+     })
+     .filter((x): x is { rel: string; content: string } => !!x && changedSet.has(x.rel));
+
+   await vscode.window.withProgress(
+     {
+       location: vscode.ProgressLocation.Notification,
+       title: `Applying learning scaffold to ${maskedToApply.length} file(s)…`,
+       cancellable: false,
+     },
+     async () => {
+       for (const mf of maskedToApply) {
+         const targetUri = vscode.Uri.joinPath(wsRoot, ...mf.rel.split("/"));
+         await ensureDirForFile(targetUri);
+         await vscode.workspace.fs.writeFile(targetUri, Buffer.from(mf.content, "utf8"));
+       }
+     }
+   );
+
+   await writeWorkspaceMarkdownWithPrompt(wsRoot, "LEARNING_EXERCISES.md", scaffold.exercisesMd, "Learning scaffold");
+
+   if (scaffold.answerKeyMd) {
+     try {
+       const ts = new Date().toISOString().replace(/[:.]/g, "-");
+       const keyDir = path.join(storageDir, "answer-keys");
+       await fsp.mkdir(keyDir, { recursive: true });
+       const keyPath = path.join(keyDir, `answer-key-${ts}.md`);
+       await fsp.writeFile(keyPath, scaffold.answerKeyMd, "utf8");
+       await context.globalState.update("learningCopilot.lastAnswerKeyPath", keyPath);
+       vscode.window.showInformationMessage(`Instructor answer key saved to extension storage: ${keyPath}`);
+     } catch (e: any) {
+       output.appendLine(`Failed to save answer key: ${e?.message ?? String(e)}`);
+     }
+   }
+
+   if (snapshotDir) {
+     vscode.window.showInformationMessage(`Solution snapshot saved to extension storage: ${snapshotDir}`);
+   }
+
+   vscode.window.showInformationMessage("Learning Copilot: Workspace modification scaffold complete.");
+ })
+  );
+
+
 }
 /**
  * Deactivates the extension.
  */
 export function deactivate() {}
 //#endregion
+
+ 
