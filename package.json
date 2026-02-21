@@ -24,7 +24,12 @@
       { "command": "learningCopilot.saveLastOutput", "title": "Learning Copilot: Save Last Output" },
       { "command": "learningCopilot.installCopilotCli", "title": "Learning Copilot: Install/Setup Copilot CLI" },
       { "command": "learningCopilot.generateCodeFilesPrompt", "title": "Learning Copilot: Generate Code Files from Prompt" },
-      { "command": "learningCopilot.compareWithSolution", "title": "Learning Copilot: Compare Active File With Solution"}
+      { "command": "learningCopilot.compareWithSolution", "title": "Learning Copilot: Compare Active File With Solution"},
+      { "command": "learningCopilot.applyBlankAtCursor", "title": "Learning Copilot: Apply Solution For Blank At Cursor" },
+      { "command": "learningCopilot.applyNextBlank", "title": "Learning Copilot: Apply Solution For Next Blank" },
+      { "command": "learningCopilot.showHintForBlankAtCursor", "title": "Learning Copilot: Show Hint For Blank At Cursor" },
+      { "command": "learningCopilot.markBlankDoneAtCursor", "title": "Learning Copilot: Mark Blank As Done At Cursor" },
+      { "command": "learningCopilot.openLatestAnswerKey", "title": "Learning Copilot: Open Latest Answer Key" }
     ],
     "configuration": {
       "title": "Learning Copilot",

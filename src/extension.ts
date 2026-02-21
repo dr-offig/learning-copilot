@@ -13,8 +13,17 @@ const SOLUTION_SCHEME = "learning-copilot-solution";
 
 type WrittenFile = { rel: string; fullContent: string };
 
+type ScaffoldBlank = {
+  id: string;
+  path: string;
+  solution: string;
+  hint?: string;
+  explanation?: string;
+};
+
 type ScaffoldPlan = {
   maskedFiles: Array<{ path: string; content: string }>;
+  blanks: ScaffoldBlank[];
   exercisesMd: string;
   answerKeyMd?: string;
   notes?: string;
@@ -666,6 +675,10 @@ function parseScaffoldPlan(jsonText: string): ScaffoldPlan {
     throw new Error("Scaffold JSON must include 'exercisesMd' string.");
   }
 
+  if (!Array.isArray(obj.blanks)) {
+    throw new Error("Scaffold JSON must include 'blanks' array.");
+  }
+
   const maskedFiles = obj.maskedFiles.map((f: any) => {
     if (!f || typeof f !== "object") {
       throw new Error("Each maskedFiles entry must be an object.");
@@ -681,7 +694,145 @@ function parseScaffoldPlan(jsonText: string): ScaffoldPlan {
     exercisesMd: obj.exercisesMd,
     answerKeyMd: typeof obj.answerKeyMd === "string" ? obj.answerKeyMd : undefined,
     notes: typeof obj.notes === "string" ? obj.notes : undefined,
+    blanks: obj.blanks
   };
+}
+
+// --- Scaffold marker/comment style validation helpers ---
+function commentStyleRuleForPath(p: string): string {
+  const ext = path.posix.extname(p.toLowerCase());
+  if (ext === ".html" || ext === ".htm" || ext === ".svg") {
+    return "HTML comments only: <!-- __LC_BLANK_<id>_START__ --> and <!-- __LC_BLANK_<id>_END__ --> on their own lines.";
+  }
+  if (ext === ".css") {
+    return "CSS comments only: /* __LC_BLANK_<id>_START__ */ and /* __LC_BLANK_<id>_END__ */ on their own lines.";
+  }
+  if ([".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"].includes(ext)) {
+    return "JS/TS comments only: // __LC_BLANK_<id>_START__ and // __LC_BLANK_<id>_END__ (or /* ... */) on their own lines.";
+  }
+  if ([".py"].includes(ext)) {
+    return "Python comments only: # __LC_BLANK_<id>_START__ and # __LC_BLANK_<id>_END__ on their own lines.";
+  }
+  if ([".md"].includes(ext)) {
+    return "Markdown/HTML comments preferred: <!-- __LC_BLANK_<id>_START__ --> and <!-- __LC_BLANK_<id>_END__ --> on their own lines.";
+  }
+  // Fallback: allow //, /* */, or #
+  return "Markers must be standalone comment lines appropriate to the language/file type.";
+}
+
+function getExpectedMarkerLineRegexForPath(p: string, which: "START" | "END"): RegExp {
+  const ext = path.posix.extname(p.toLowerCase());
+  const tok = `__LC_BLANK_[A-Za-z0-9_-]+_${which}__`;
+  if (ext === ".html" || ext === ".htm" || ext === ".svg" || ext === ".md") {
+    return new RegExp(`^\\s*<!--\\s*${tok}\\s*-->\\s*$`);
+  }
+  if (ext === ".css") {
+    return new RegExp(`^\\s*\\/\\*\\s*${tok}\\s*\\*\\/\\s*$`);
+  }
+  if ([".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"].includes(ext)) {
+    return new RegExp(`^\\s*(?:\\/\\/\\s*${tok}\\s*|\\/\\*\\s*${tok}\\s*\\*\\/)\\s*$`);
+  }
+  if (ext === ".py") {
+    return new RegExp(`^\\s*#\\s*${tok}\\s*$`);
+  }
+  // permissive fallback
+  return new RegExp(`^\\s*(?:\\/\\/|#|--|;|<!--|\\/\\*)?\\s*${tok}`);
+}
+
+type ScaffoldValidationIssue = {
+  kind: "badCommentStyle" | "missingMarkers" | "missingBlankMapping" | "blankAlreadySolved" | "solutionNotFound";
+  file?: string;
+  id?: string;
+  detail: string;
+};
+
+function extractRegionsForFile(content: string): BlankRegionHit[] {
+  return listBlankRegions(content);
+}
+
+function extractRegionEditableText(content: string, r: BlankRegionHit): string {
+  return content.slice(r.startTokenEnd, r.endTokenStart);
+}
+
+function validateScaffoldPlan(plan: ScaffoldPlan): ScaffoldValidationIssue[] {
+  const issues: ScaffoldValidationIssue[] = [];
+
+  const blanksByFileAndId = new Map<string, Map<string, ScaffoldBlank>>();
+  for (const b of plan.blanks) {
+    let rel: string;
+    try { rel = normalizeRelativePath(b.path); }
+    catch {
+      issues.push({ kind: "missingBlankMapping", file: b.path, id: b.id, detail: `Blank has invalid path: ${b.path}` });
+      continue;
+    }
+    const m = blanksByFileAndId.get(rel) ?? new Map<string, ScaffoldBlank>();
+    m.set(b.id, b);
+    blanksByFileAndId.set(rel, m);
+  }
+
+  for (const mf of plan.maskedFiles) {
+    let rel: string;
+    try { rel = normalizeRelativePath(mf.path); }
+    catch {
+      issues.push({ kind: "missingMarkers", file: mf.path, detail: `Masked file has invalid path: ${mf.path}` });
+      continue;
+    }
+
+    const regions = extractRegionsForFile(mf.content);
+    if (regions.length === 0) {
+      // It is allowed to have no blanks in some files, but often indicates a scaffold failure.
+      continue;
+    }
+
+    const startLineRe = getExpectedMarkerLineRegexForPath(rel, "START");
+    const endLineRe = getExpectedMarkerLineRegexForPath(rel, "END");
+    const lines = mf.content.split(/\r?\n/);
+
+    for (const r of regions) {
+      const blankMap = blanksByFileAndId.get(rel);
+      const blank = blankMap?.get(r.id);
+      if (!blank) {
+        issues.push({ kind: "missingBlankMapping", file: rel, id: r.id, detail: `Region ${r.id} appears in ${rel} but no matching entry exists in plan.blanks.` });
+      }
+
+      const startLineIdx = mf.content.slice(0, r.startTokenStart).split(/\r?\n/).length - 1;
+      const endLineIdx = mf.content.slice(0, r.endTokenStart).split(/\r?\n/).length - 1;
+      const startLine = lines[startLineIdx] ?? "";
+      const endLine = lines[endLineIdx] ?? "";
+
+      if (!startLineRe.test(startLine) || !endLineRe.test(endLine)) {
+        issues.push({
+          kind: "badCommentStyle",
+          file: rel,
+          id: r.id,
+          detail: `Marker comment style mismatch in ${rel} for ${r.id}. Expected: ${commentStyleRuleForPath(rel)} Found START line='${startLine.trim()}', END line='${endLine.trim()}'.`,
+        });
+      }
+
+      if (blank) {
+        const currentEditable = extractRegionEditableText(mf.content, r);
+        const normA = currentEditable.replace(/\s+/g, " ").trim();
+        const normB = (blank.solution ?? "").replace(/\s+/g, " ").trim();
+        if (normB.length === 0) {
+          issues.push({ kind: "solutionNotFound", file: rel, id: r.id, detail: `Blank ${r.id} in ${rel} has empty solution.` });
+        } else if (normA === normB) {
+          issues.push({ kind: "blankAlreadySolved", file: rel, id: r.id, detail: `Blank ${r.id} in ${rel} still contains the full solution between markers (nothing for student to do).` });
+        }
+      }
+    }
+  }
+
+  return issues;
+}
+
+function formatScaffoldIssuesForPrompt(issues: ScaffoldValidationIssue[]): string {
+  return issues
+    .slice(0, 12)
+    .map((i, idx) => {
+      const where = [i.file, i.id].filter(Boolean).join(" :: ");
+      return `${idx + 1}. [${i.kind}] ${where} — ${i.detail}`;
+    })
+    .join("\n");
 }
 
 
@@ -781,6 +932,114 @@ async function pickSaveUri(context: vscode.ExtensionContext): Promise<vscode.Uri
 
 //#endregion
 
+//#region <BLANK FILLING HELPERS>
+/**
+ * ============================================================================
+ * <BLANK FILLING HELPERS>
+ * ============================================================================
+ * Helpers for prompting the user to fill in blanks in the scaffold, and for
+ * generating follow-up explanations and answer keys based on the filled-in
+ * content.
+ */
+type BlankRegionHit = {
+  id: string;
+  startTokenStart: number;
+  startTokenEnd: number;
+  endTokenStart: number;
+  endTokenEnd: number;
+};
+
+function getBlankStartRegex(): RegExp {
+  return /__LC_BLANK_([A-Za-z0-9_-]+)_START__/g;
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function getBlankEndRegexForId(id: string): RegExp {
+  return new RegExp(`__LC_BLANK_${escapeRegExp(id)}_END__`, "g");
+}
+
+function listBlankRegions(docText: string): BlankRegionHit[] {
+  const hits: BlankRegionHit[] = [];
+  const startRe = getBlankStartRegex();
+  let m: RegExpExecArray | null;
+
+  while ((m = startRe.exec(docText))) {
+    const id = m[1];
+    const startTokenStart = m.index;
+    const startTokenEnd = startTokenStart + m[0].length;
+
+    const endRe = getBlankEndRegexForId(id);
+    endRe.lastIndex = startTokenEnd;
+    const endM = endRe.exec(docText);
+    if (!endM) {continue;} // unmatched start
+
+    const endTokenStart = endM.index;
+    const endTokenEnd = endTokenStart + endM[0].length;
+
+    hits.push({ id, startTokenStart, startTokenEnd, endTokenStart, endTokenEnd });
+  }
+
+  hits.sort((a, b) => a.startTokenStart - b.startTokenStart);
+  return hits;
+}
+
+function findBlankRegionAtPosition(docText: string, offset: number): BlankRegionHit | null {
+  const regions = listBlankRegions(docText);
+  for (const r of regions) {
+    if (offset >= r.startTokenStart && offset <= r.endTokenEnd) {return r;}
+  }
+  return null;
+}
+
+function findNextBlankRegion(docText: string, offset: number): BlankRegionHit | null {
+  const regions = listBlankRegions(docText);
+  for (const r of regions) {
+    if (r.startTokenStart >= offset) {return r;}
+  }
+  return null;
+}
+
+function getEditableRangeForRegion(doc: vscode.TextDocument, r: BlankRegionHit): vscode.Range {
+  // We expect marker tokens to live on their own lines inside comment delimiters.
+  // Replace the content *between* the marker lines, leaving comment delimiters intact.
+  const startPos = doc.positionAt(r.startTokenStart);
+  const endPos = doc.positionAt(r.endTokenEnd);
+
+  const startLine = doc.lineAt(startPos.line);
+  const endLine = doc.lineAt(endPos.line);
+
+  // Insert after the end of the start marker line (including its comment close),
+  // and stop before the beginning of the end marker line.
+  const replaceStart = startLine.rangeIncludingLineBreak.end;
+  const replaceEnd = endLine.range.start;
+
+  // Fallback: if markers are malformed (e.g. same line), fall back to token-based region.
+  if (doc.offsetAt(replaceStart) >= doc.offsetAt(replaceEnd)) {
+    return new vscode.Range(doc.positionAt(r.startTokenEnd), doc.positionAt(r.endTokenStart));
+  }
+
+  return new vscode.Range(replaceStart, replaceEnd);
+}
+
+function getRelPathForActiveDoc(wsRoot: vscode.Uri, docUri: vscode.Uri): string {
+  const rel = path.relative(wsRoot.fsPath, docUri.fsPath).replace(/\\/g, "/");
+  return normalizeRelativePath(rel);
+}
+
+function getBlankById(context: vscode.ExtensionContext, rel: string, id: string): ScaffoldBlank | null {
+  const all = context.globalState.get<ScaffoldBlank[]>("learningCopilot.lastScaffoldBlanks") ?? [];
+  for (const b of all) {
+    try {
+      if (normalizeRelativePath(b.path) === rel && b.id === id) { return b; }
+    } catch {}
+  }
+  return null;
+}  
+
+
 //#region <EXTENSION LIFECYCLE AND COMMANDS>
 /**
  * ============================================================================
@@ -833,12 +1092,37 @@ async function generateLearningScaffold(
   const scaffoldPrompt =
     "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
     "You are a teaching assistant. Given a COMPLETE working solution for a small programming project, create a LEARNING SCAFFOLD. " +
-    "Output schema: {\"maskedFiles\":[{\"path\":string,\"content\":string}],\"exercisesMd\":string,\"answerKeyMd\":string?,\"notes\":string?}. " +
-    "Rules: (1) maskedFiles must include only files listed in the input (same paths). " +
-    "(2) Replace about 5–15% of key code with blanks/TODOs so the project is not fully working. " +
-    "Use placeholders like '/* TODO: ... */', '// TODO: ...', or '__BLANK__'. " +
-    "(3) exercisesMd must reference the whole project, list specific tasks to fill blanks, and include at least 5 comprehension questions. " +
-    "(4) answerKeyMd should include the removed code fragments and brief explanations. " +
+    "Output schema: " +
+    "{\"maskedFiles\":[{\"path\":string,\"content\":string}]," +
+    "\"blanks\":[{\"id\":string,\"path\":string,\"solution\":string,\"hint\":string?,\"explanation\":string?}]," +
+    "\"exercisesMd\":string," +
+    "\"answerKeyMd\":string?," +
+    "\"notes\":string?}. " +
+    "STRICT RULES: " +
+    "(1) maskedFiles must include ONLY files listed in the input (same paths). " +
+    "(2) Replace about 5–15% of IMPORTANT logic with blank REGIONS that remain identifiable after the student edits. " +
+    "Each blank region MUST be wrapped by two exact tokens: __LC_BLANK_<id>_START__ and __LC_BLANK_<id>_END__. " +
+    "The student-editable placeholder content must appear BETWEEN these two tokens. " +
+    "Markers MUST appear on their own lines as standalone comments containing only the token (plus comment delimiters). Do not place marker tokens inline with code. " +
+    "Do NOT use generic TODO comments. Do NOT use __BLANK__. " +
+    "(3) Every blank region MUST have a corresponding entry in the 'blanks' array. The 'id' must exactly match the wrapper token suffix (e.g. validateInput). " +
+    "(4) The 'path' field in each blank must match the file where the region appears. " +
+    "(5) The 'solution' field must contain ONLY the exact code that replaces the placeholder content BETWEEN the START and END tokens. " +
+    "Do NOT include the wrapper tokens in solution. Do NOT include markdown fences. Do NOT include explanation inside the solution. Code only. " +
+    // ---- INSERTED rules (5b) and (5c) here ----
+    "(5b) COMMENT STYLE: The START/END marker lines must use the correct comment syntax for each file type: " +
+    "HTML (.html/.htm/.svg): <!-- __LC_BLANK_<id>_START__ --> and <!-- __LC_BLANK_<id>_END__ -->. " +
+    "CSS (.css): /* __LC_BLANK_<id>_START__ */ and /* __LC_BLANK_<id>_END__ */. " +
+    "JS/TS (.js/.ts/.jsx/.tsx/.mjs/.cjs): // __LC_BLANK_<id>_START__ and // __LC_BLANK_<id>_END__ (or /* ... */). " +
+    "Python (.py): # __LC_BLANK_<id>_START__ and # __LC_BLANK_<id>_END__. " +
+    "Each marker MUST be on its own line and contain ONLY the token (plus comment delimiters). " +
+    "(5c) The placeholder content BETWEEN START and END MUST be incomplete/incorrect compared to solution (i.e., not equal to the solution). The scaffold must require student edits to become fully working. " +
+    // ---- end inserted ----
+    "(6) 'hint' should guide the student without revealing the solution. " +
+    "(7) 'explanation' should briefly explain what the solution does and why it is correct. " +
+    "(8) exercisesMd must reference the entire project, explicitly refer to blank IDs, and include at least 5 conceptual/comprehension questions about the project architecture and logic. " +
+    "(9) answerKeyMd must be an INSTRUCTOR KEY that includes: (a) each blank with its id, path, solution, and explanation; and (b) ANSWERS to every comprehension question in exercisesMd, matching the same numbering/headings so they can be cross-referenced. " +
+    "(10) Do NOT remove import statements, package declarations, or file-level boilerplate unless pedagogically critical." +
     "Input files (JSON array): " +
     JSON.stringify(filePayload);
 
@@ -863,7 +1147,60 @@ async function generateLearningScaffold(
     throw new Error("Copilot scaffold generation returned empty stdout.");
   }
 
-  return parseScaffoldPlan(stdout);
+  // Scaffold output validation and single repair pass
+  const parsed = parseScaffoldPlan(stdout);
+  const issues = validateScaffoldPlan(parsed);
+  if (issues.length > 0) {
+    output.appendLine("\n--- Scaffold validation issues detected; attempting one repair pass ---");
+    output.appendLine(formatScaffoldIssuesForPrompt(issues));
+
+    // Ask Copilot to repair only the scaffold output (maskedFiles/blanks/exercises/answerKey) given the same input files.
+    const repairPrompt =
+      "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
+      "You previously produced an invalid learning scaffold. Fix it. " +
+      "Output schema MUST remain: {\"maskedFiles\":[{\"path\":string,\"content\":string}],\"blanks\":[{\"id\":string,\"path\":string,\"solution\":string,\"hint\":string?,\"explanation\":string?}],\"exercisesMd\":string,\"answerKeyMd\":string?,\"notes\":string?}. " +
+      "Fix ALL of these validation issues:\n" +
+      formatScaffoldIssuesForPrompt(issues) +
+      "\n\nRules to follow: " +
+      "- Use correct per-file comment syntax for marker lines (HTML uses <!-- -->, CSS uses /* */, JS uses // or /* */, etc.). " +
+      "- Markers must be on their own lines and contain only the token + comment delimiters. " +
+      "- Placeholder between markers must NOT equal the solution; it must be incomplete so the student must edit. " +
+      "- maskedFiles may only include input paths. " +
+      "Input files (JSON array): " +
+      JSON.stringify(filePayload);
+
+    const repairRes = await runCopilotPrompt(
+      copilotPath,
+      copilotArgs,
+      storageDir,
+      repairPrompt,
+      configDir,
+      logDir,
+      output,
+      envOverride
+    );
+
+    const repairStdout = repairRes.stdout.trim();
+    if (repairRes.exitCode !== 0) {
+      throw new Error(repairRes.stderr.trim() || `Copilot scaffold repair failed (exit ${repairRes.exitCode}).`);
+    }
+    if (!repairStdout) {
+      throw new Error("Copilot scaffold repair returned empty stdout.");
+    }
+
+    const repaired = parseScaffoldPlan(repairStdout);
+    const issues2 = validateScaffoldPlan(repaired);
+    if (issues2.length > 0) {
+      output.appendLine("\n--- Scaffold repair still has issues (returning repaired output anyway). ---");
+      output.appendLine(formatScaffoldIssuesForPrompt(issues2));
+      return repaired;
+    }
+
+    output.appendLine("\n--- Scaffold repair succeeded. ---");
+    return repaired;
+  }
+
+  return parsed;
 }
 
 /**
@@ -1435,6 +1772,8 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
 
+      await context.globalState.update("learningCopilot.lastScaffoldBlanks", scaffold.blanks);
+
       if (scaffold.notes) {
         output.appendLine("--- scaffold notes ---");
         output.appendLine(scaffold.notes);
@@ -1487,7 +1826,9 @@ export async function activate(context: vscode.ExtensionContext) {
           await fsp.mkdir(keyDir, { recursive: true });
           const keyPath = path.join(keyDir, `answer-key-${ts}.md`);
           await fsp.writeFile(keyPath, scaffold.answerKeyMd, "utf8");
+          await context.globalState.update("learningCopilot.lastAnswerKeyPath", keyPath);
           vscode.window.showInformationMessage(`Instructor answer key saved to extension storage: ${keyPath}`);
+          vscode.window.showInformationMessage("Use 'Learning Copilot: Open Latest Answer Key' to view comprehension answers.");
         } catch (e: any) {
           output.appendLine(`Failed to save answer key: ${e?.message ?? String(e)}`);
         }
@@ -1536,13 +1877,232 @@ export async function activate(context: vscode.ExtensionContext) {
       }
 
       const solutionUri = vscode.Uri.parse(`${SOLUTION_SCHEME}:/${rel}`);
-      const title = `Solution ↔ Current: ${rel}`;
+      const title = `Current ↔ Solution: ${rel} (use ← to apply solution)`;
 
-      // Left = solution, Right = student's current file
-      await vscode.commands.executeCommand("vscode.diff", solutionUri, editor.document.uri, title);
+      // Left = student's current file (editable), Right = solution snapshot (read-only virtual doc)
+      await vscode.commands.executeCommand("vscode.diff", editor.document.uri, solutionUri, title);
     })
   );
 
+  // Apply blank at cursor
+  context.subscriptions.push(
+    vscode.commands.registerCommand("learningCopilot.applyBlankAtCursor", async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) { return vscode.window.showWarningMessage("Open a file first."); }
+
+      const wsRoot = getWorkspaceRootUri();
+      if (!wsRoot) { return vscode.window.showErrorMessage("Open a folder/workspace first."); }
+
+      let rel: string;
+      try { rel = getRelPathForActiveDoc(wsRoot, editor.document.uri); }
+      catch { return vscode.window.showErrorMessage("Active file is not within the current workspace root."); }
+
+      const text = editor.document.getText();
+      const offset = editor.document.offsetAt(editor.selection.active);
+      const hit = findBlankRegionAtPosition(text, offset);
+      if (!hit) {
+        return vscode.window.showWarningMessage(
+          "No __LC_BLANK_<id>_START__/__LC_BLANK_<id>_END__ region under the cursor."
+        );
+      }
+
+      const range = getEditableRangeForRegion(editor.document, hit);
+      
+      const blank = getBlankById(context, rel, hit.id);
+      if (!blank) { return vscode.window.showErrorMessage(`No stored solution mapping for blank id: ${hit.id}`); }
+
+      // Ensure the END marker stays on its own line.
+      // Our replacement range ends at the start of the END marker line, so if the inserted
+      // solution doesn't end with a newline, the END marker would end up on the same line.
+      const insert = blank.solution.endsWith("\n") ? blank.solution : blank.solution + "\n";
+      await editor.edit((eb) => eb.replace(range, insert));
+      vscode.window.showInformationMessage(`Applied solution for blank: ${hit.id}`);
+    })
+  );
+ 
+  context.subscriptions.push(
+    vscode.commands.registerCommand("learningCopilot.applyNextBlank", async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) {return vscode.window.showWarningMessage("Open a file first.");}
+
+      const wsRoot = getWorkspaceRootUri();
+      if (!wsRoot) {return vscode.window.showErrorMessage("Open a folder/workspace first.");}
+
+      let rel: string;
+      try { rel = getRelPathForActiveDoc(wsRoot, editor.document.uri); }
+      catch { return vscode.window.showErrorMessage("Active file is not within the current workspace root."); }
+
+      const text = editor.document.getText();
+      const offset = editor.document.offsetAt(editor.selection.active);
+      const next = findNextBlankRegion(text, offset);
+      if (!next) { return vscode.window.showInformationMessage("No further blank regions found in this file."); }
+      const blank = getBlankById(context, rel, next.id);
+      if (!blank) {return vscode.window.showErrorMessage(`No stored solution mapping for blank id: ${next.id}`);}
+      const range = getEditableRangeForRegion(editor.document, next);
+      // Ensure the END marker stays on its own line.
+      const insert = blank.solution.endsWith("\n") ? blank.solution : blank.solution + "\n";
+      const insertLen = insert.length;
+      const newPos = editor.document.positionAt(next.startTokenEnd + insertLen);
+   
+      await editor.edit((eb) => eb.replace(range, insert));
+
+      editor.selection = new vscode.Selection(newPos, newPos);
+      editor.revealRange(new vscode.Range(newPos, newPos));
+
+      vscode.window.showInformationMessage(`Applied next blank: ${next.id}`);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("learningCopilot.showHintForBlankAtCursor", async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) { return vscode.window.showWarningMessage("Open a file first."); }
+
+      const wsRoot = getWorkspaceRootUri();
+      if (!wsRoot) { return vscode.window.showErrorMessage("Open a folder/workspace first."); }
+
+      let rel: string;
+      try { rel = getRelPathForActiveDoc(wsRoot, editor.document.uri); }
+      catch { return vscode.window.showErrorMessage("Active file is not within the current workspace root."); }
+
+      const text = editor.document.getText();
+      const offset = editor.document.offsetAt(editor.selection.active);
+      const hit = findBlankRegionAtPosition(text, offset);
+      if (!hit) {
+        return vscode.window.showWarningMessage(
+          "No __LC_BLANK_<id>_START__/__LC_BLANK_<id>_END__ region under the cursor."
+        );
+      }
+      const blank = getBlankById(context, rel, hit.id);
+      if (!blank) { return vscode.window.showErrorMessage(`No stored mapping for blank id: ${hit.id}`); }
+
+      const parts: string[] = [];
+      if (blank.hint) { parts.push(`Hint: ${blank.hint}`); }
+      if (blank.explanation) { parts.push(`Explanation: ${blank.explanation}`); }
+      if (parts.length === 0) { return vscode.window.showInformationMessage("No hint/explanation provided for this blank."); }
+
+      vscode.window.showInformationMessage(parts.join("\n\n"));
+    })
+  );
+
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("learningCopilot.markBlankDoneAtCursor", async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) {return vscode.window.showWarningMessage("Open a file first.");}
+
+      const wsRoot = getWorkspaceRootUri();
+      if (!wsRoot) {return vscode.window.showErrorMessage("Open a folder/workspace first.");}
+
+      const doc = editor.document;
+
+      let rel: string;
+      try {
+        rel = getRelPathForActiveDoc(wsRoot, doc.uri);
+      } catch {
+        return vscode.window.showErrorMessage("Active file is not within the current workspace root.");
+      }
+
+      const text = doc.getText();
+      const offset = doc.offsetAt(editor.selection.active);
+      const hit = findBlankRegionAtPosition(text, offset);
+      if (!hit) {
+        return vscode.window.showWarningMessage(
+          "No __LC_BLANK_<id>_START__/__LC_BLANK_<id>_END__ region under the cursor."
+        );
+      }
+
+      const confirm = await vscode.window.showInformationMessage(
+        `Mark blank '${hit.id}' as done? This will remove its START/END markers but keep the current content.`,
+        { modal: true },
+        "Mark Done",
+        "Cancel"
+      );
+      if (confirm !== "Mark Done") {return;}
+
+      // Helper: decide whether a line is “just a marker comment”
+      const lineLooksLikeOnlyMarker = (lineText: string) => {
+        const trimmed = lineText.trim();
+        if (!trimmed) {return false;}
+        const hasToken = trimmed.includes("__LC_BLANK_") && (trimmed.includes("_START__") || trimmed.includes("_END__"));
+        if (!hasToken) {return false;}
+
+        // Remove token(s)
+        let rest = trimmed.replace(/__LC_BLANK_[A-Za-z0-9_-]+_(?:START|END)__/g, "");
+
+        // Remove common comment wrappers
+        rest = rest
+          .replace(/^\/\/+/, "")     // //
+          .replace(/^#/, "")         // #
+          .replace(/^<!--/, "")      // <!--
+          .replace(/-->$/, "")       // -->
+          .replace(/^\/\*/, "")      // /*
+          .replace(/\*\/$/, "")      // */
+          .replace(/^--+/, "")       // -- (SQL)
+          .replace(/^;+/, "");       // ;
+
+        return rest.trim().length === 0;
+      };
+
+      const removeMarkerTokensFromLine = (lineText: string) =>
+        lineText.replace(/__LC_BLANK_[A-Za-z0-9_-]+_(?:START|END)__/g, "");
+
+      // Compute edits from the original doc (apply in reverse order)
+      const startPos = doc.positionAt(hit.startTokenStart);
+      const endPos = doc.positionAt(hit.endTokenEnd);
+
+      const startLine = doc.lineAt(startPos.line);
+      const endLine = doc.lineAt(endPos.line);
+
+      const edits: Array<{ range: vscode.Range; replacement: string }> = [];
+
+      if (lineLooksLikeOnlyMarker(startLine.text)) {
+        edits.push({ range: startLine.rangeIncludingLineBreak, replacement: "" });
+      } else {
+        edits.push({ range: startLine.range, replacement: removeMarkerTokensFromLine(startLine.text) });
+      }
+
+      if (lineLooksLikeOnlyMarker(endLine.text)) {
+        edits.push({ range: endLine.rangeIncludingLineBreak, replacement: "" });
+      } else {
+        edits.push({ range: endLine.range, replacement: removeMarkerTokensFromLine(endLine.text) });
+      }
+
+      // Apply edits in reverse order so ranges don't shift
+      await editor.edit((eb) => {
+        edits
+          .sort((a, b) => doc.offsetAt(b.range.start) - doc.offsetAt(a.range.start))
+          .forEach((e) => eb.replace(e.range, e.replacement));
+      });
+
+      // Optional: remove this blank from stored mapping so it’s not offered anymore
+      const all = context.globalState.get<ScaffoldBlank[]>("learningCopilot.lastScaffoldBlanks") ?? [];
+      const filtered = all.filter((b) => !(normalizeRelativePath(b.path) === rel && b.id === hit.id));
+      await context.globalState.update("learningCopilot.lastScaffoldBlanks", filtered);
+
+      vscode.window.showInformationMessage(`Marked blank as done: ${hit.id}`);
+    })
+  );
+
+    // Open latest instructor answer key (includes comprehension answers)
+  context.subscriptions.push(
+    vscode.commands.registerCommand("learningCopilot.openLatestAnswerKey", async () => {
+      const keyPath = context.globalState.get<string>("learningCopilot.lastAnswerKeyPath");
+      if (!keyPath) {
+        vscode.window.showWarningMessage(
+          "No instructor answer key saved yet. Generate a scaffold with an answer key first."
+        );
+        return;
+      }
+      try {
+        const uri = vscode.Uri.file(keyPath);
+        const doc = await vscode.workspace.openTextDocument(uri);
+        await vscode.window.showTextDocument(doc, { preview: true });
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`Failed to open answer key: ${e?.message ?? String(e)}`);
+      }
+    })
+  );
 
 }
 /**
