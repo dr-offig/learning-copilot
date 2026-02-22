@@ -10,17 +10,10 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [
-    "onCommand:learningCopilot.generateExercisePrompt",
-    "onCommand:learningCopilot.generateExerciseSelection",
-    "onCommand:learningCopilot.saveLastOutput",
-    "onCommand:learningCopilot.installCopilotCli"
-  ],
+  "activationEvents": [],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
-      { "command": "learningCopilot.generateExercisePrompt", "title": "Learning Copilot: Generate Exercise from Prompt" },
-      { "command": "learningCopilot.generateExerciseSelection", "title": "Learning Copilot: Generate Exercise from Selection" },
       { "command": "learningCopilot.saveLastOutput", "title": "Learning Copilot: Save Last Output" },
       { "command": "learningCopilot.installCopilotCli", "title": "Learning Copilot: Install/Setup Copilot CLI" },
       { "command": "learningCopilot.generateCodeFilesPrompt", "title": "Learning Copilot: Generate Code Files from Prompt" },

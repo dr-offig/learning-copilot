@@ -7,6 +7,19 @@ import * as path from "node:path";
 
 let lastOutput: string | null = null;
 
+let statusBar: vscode.StatusBarItem | null = null;
+
+function setBusyStatus(text: string | null) {
+  if (!statusBar) { return; }
+  if (!text) {
+    statusBar.hide();
+    return;
+  }
+  statusBar.text = `$(sync~spin) ${text}`;
+  statusBar.tooltip = "Learning Copilot is working…";
+  statusBar.show();
+}
+
 const proposedContent = new Map<string, string>();
 const PROPOSED_SCHEME = "learning-copilot";
 const SOLUTION_SCHEME = "learning-copilot-solution";
@@ -1213,6 +1226,75 @@ function getEditableRangeForRegion(doc: vscode.TextDocument, r: BlankRegionHit):
   return new vscode.Range(replaceStart, replaceEnd);
 }
 
+function getIndentationForLine(doc: vscode.TextDocument, line: number): string {
+  const text = doc.lineAt(line).text;
+  const m = text.match(/^\s*/);
+  return m ? m[0] : "";
+}
+
+function getFullRegionRangeIncludingMarkerLines(doc: vscode.TextDocument, r: BlankRegionHit): vscode.Range {
+  const startPos = doc.positionAt(r.startTokenStart);
+  const endPos = doc.positionAt(r.endTokenEnd);
+
+  const startLine = doc.lineAt(startPos.line);
+  const endLine = doc.lineAt(endPos.line);
+
+  // Replace from beginning of START marker line to end of END marker line (including newline if present)
+  const replaceStart = startLine.range.start;
+  const replaceEnd = endLine.rangeIncludingLineBreak.end;
+
+  // Fallback if something weird happens (e.g., both tokens on same line)
+  if (doc.offsetAt(replaceStart) >= doc.offsetAt(replaceEnd)) {
+    return new vscode.Range(doc.positionAt(r.startTokenStart), doc.positionAt(r.endTokenEnd));
+  }
+
+  return new vscode.Range(replaceStart, replaceEnd);
+}
+
+function normalizeSolutionNewlines(s: string): string {
+  return s.replace(/\r\n/g, "\n");
+}
+
+async function applySolutionForRegion(
+  editor: vscode.TextEditor,
+  doc: vscode.TextDocument,
+  region: BlankRegionHit,
+  solution: string,
+  removeMarkers: boolean
+): Promise<void> {
+  const sol = normalizeSolutionNewlines(solution);
+
+  if (!removeMarkers) {
+    // Old behavior: replace only editable area
+    const editable = getEditableRangeForRegion(doc, region);
+    await editor.edit((eb) => {
+      const replacement = sol.endsWith("\n") ? sol : sol + "\n";
+      eb.replace(editable, replacement);
+    });
+    return;
+  }
+
+  // New behavior: remove marker lines too
+  const startPos = doc.positionAt(region.startTokenStart);
+  const indent = getIndentationForLine(doc, startPos.line);
+
+  const fullRange = getFullRegionRangeIncludingMarkerLines(doc, region);
+
+  // Indent multi-line solutions to match marker indentation (best-effort)
+  let replacement = sol;
+  if (replacement.includes("\n")) {
+    const lines = replacement.split("\n");
+    replacement = lines.map((ln, idx) => (idx === 0 ? ln : indent + ln)).join("\n");
+  }
+
+  // Ensure we don't glue following code to last line
+  replacement = replacement.replace(/\s*$/g, "") + "\n";
+
+  await editor.edit((eb) => {
+    eb.replace(fullRange, replacement);
+  });
+}
+
 function getRelPathForActiveDoc(wsRoot: vscode.Uri, docUri: vscode.Uri): string {
   const rel = path.relative(wsRoot.fsPath, docUri.fsPath).replace(/\\/g, "/");
   return normalizeRelativePath(rel);
@@ -1356,131 +1438,181 @@ async function generateLearningScaffold(
   output: vscode.OutputChannel,
   envOverride: NodeJS.ProcessEnv
 ): Promise<ScaffoldPlan> {
-  // keep prompt size reasonable
-  const MAX_CHARS_PER_FILE = 12000;
-  const filePayload = written.map((f) => ({
-    path: f.rel,
-    content:
-      f.fullContent.length > MAX_CHARS_PER_FILE
-        ? f.fullContent.slice(0, MAX_CHARS_PER_FILE) + "\n\n/* TRUNCATED */\n"
-        : f.fullContent,
-  }));
+  
+  return await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "Learning Copilot: Generating learning scaffold…",
+      cancellable: false,
+    },
+    async (progress) => {
+      let hb: NodeJS.Timeout | undefined;
+      let hbTick = 0;
+      try {
+        setBusyStatus("Generating learning scaffold");
+        progress.report({ message: "Preparing prompt…" });
 
-  const scaffoldPrompt =
-    "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
-    "You are a teaching assistant. Given a COMPLETE working solution for a small programming project, create a LEARNING SCAFFOLD. " +
-    "Output schema: " +
-    "{\"maskedFiles\":[{\"path\":string,\"content\":string}]," +
-    "\"blanks\":[{\"id\":string,\"path\":string,\"solution\":string,\"hint\":string?,\"explanation\":string?}]," +
-    "\"exercisesMd\":string," +
-    "\"answerKeyMd\":string?," +
-    "\"notes\":string?}. " +
-    "STRICT RULES: " +
-    "(1) maskedFiles must include ONLY files listed in the input (same paths). " +
-    "(2) Replace about 5–15% of IMPORTANT logic with blank REGIONS that remain identifiable after the student edits. " +
-    "Each blank region MUST be wrapped by two exact tokens: __LC_BLANK_<id>_START__ and __LC_BLANK_<id>_END__. " +
-    "The student-editable placeholder content must appear BETWEEN these two tokens. " +
-    "Markers MUST appear on their own lines as standalone comments containing only the token (plus comment delimiters). Do not place marker tokens inline with code. " +
-    "Do NOT use generic TODO comments. Do NOT use __BLANK__. " +
-    "(3) Every blank region MUST have a corresponding entry in the 'blanks' array. The 'id' must exactly match the wrapper token suffix (e.g. validateInput). " +
-    "(4) The 'path' field in each blank must match the file where the region appears. " +
-    "(5) The 'solution' field must contain ONLY the exact code that replaces the placeholder content BETWEEN the START and END tokens. " +
-    "Do NOT include the wrapper tokens in solution. Do NOT include markdown fences. Do NOT include explanation inside the solution. Code only. " +
-    // ---- INSERTED rules (5b) and (5c) here ----
-    "(5b) COMMENT STYLE: The START/END marker lines must use the correct comment syntax for each file type: " +
-    "HTML (.html/.htm/.svg): <!-- __LC_BLANK_<id>_START__ --> and <!-- __LC_BLANK_<id>_END__ -->. " +
-    "CSS (.css): /* __LC_BLANK_<id>_START__ */ and /* __LC_BLANK_<id>_END__ */. " +
-    "JS/TS (.js/.ts/.jsx/.tsx/.mjs/.cjs): // __LC_BLANK_<id>_START__ and // __LC_BLANK_<id>_END__ (or /* ... */). " +
-    "Python (.py): # __LC_BLANK_<id>_START__ and # __LC_BLANK_<id>_END__. " +
-    "Each marker MUST be on its own line and contain ONLY the token (plus comment delimiters). " +
-    "(5c) The placeholder content BETWEEN START and END MUST be incomplete/incorrect compared to solution (i.e., not equal to the solution). The scaffold must require student edits to become fully working. " +
-    // ---- end inserted ----
-    "(6) 'hint' should guide the student without revealing the solution. " +
-    "(7) 'explanation' should briefly explain what the solution does and why it is correct. " +
-    "(8) exercisesMd must reference the entire project, explicitly refer to blank IDs, and include a section titled 'Comprehension Questions'. " +
-    "In that section, include at least 5 questions, EACH tagged with a stable identifier like [CQ1], [CQ2], ... (include the tag literally in the question line). " +
-    "(9) answerKeyMd must be an INSTRUCTOR KEY that includes: (a) each blank with its id, path, solution, and explanation; and (b) a section titled 'Comprehension Answers' that answers EVERY comprehension question. " +
-    "Each answer MUST repeat the same tag, e.g. '[CQ1] ...answer...'. " +
-    "(10) Do NOT remove import statements, package declarations, or file-level boilerplate unless pedagogically critical." +
-    "Input files (JSON array): " +
-    JSON.stringify(filePayload);
+        // Ensure the user can see logs during long scaffold runs.
+        output.show(true);
 
-  const res = await runCopilotPrompt(
-    copilotPath,
-    copilotArgs,
-    storageDir,
-    scaffoldPrompt,
-    configDir,
-    logDir,
-    output,
-    envOverride
-  );
+        // Heartbeat: keep progress UI visibly updating during long waits.
+        hbTick = 0;
+        hb = setInterval(() => {
+          hbTick++;
+          // Increment provides visual activity; message is occasional to avoid spam.
+          progress.report({
+            increment: 1,
+            message: hbTick % 3 === 0 ? "Still working…" : undefined,
+          });
+        }, 5000);
 
-  const stderr = res.stderr.trim();
-  const stdout = res.stdout.trim();
+  
+        // keep prompt size reasonable
+        const MAX_CHARS_PER_FILE = 12000;
+        const filePayload = written.map((f) => ({
+          path: f.rel,
+          content:
+            f.fullContent.length > MAX_CHARS_PER_FILE
+              ? f.fullContent.slice(0, MAX_CHARS_PER_FILE) + "\n\n/* TRUNCATED */\n"
+              : f.fullContent,
+        }));
 
-  if (res.exitCode !== 0) {
-    throw new Error(stderr || `Copilot scaffold generation failed (exit ${res.exitCode}).`);
-  }
-  if (!stdout) {
-    throw new Error("Copilot scaffold generation returned empty stdout.");
-  }
+        const scaffoldPrompt =
+          "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
+          "You are a teaching assistant. Given a COMPLETE working solution for a small programming project, create a LEARNING SCAFFOLD. " +
+          "Output schema: " +
+          "{\"maskedFiles\":[{\"path\":string,\"content\":string}]," +
+          "\"blanks\":[{\"id\":string,\"path\":string,\"solution\":string,\"hint\":string?,\"explanation\":string?}]," +
+          "\"exercisesMd\":string," +
+          "\"answerKeyMd\":string?," +
+          "\"notes\":string?}. " +
+          "STRICT RULES: " +
+          "(1) maskedFiles must include ONLY files listed in the input (same paths). " +
+          "(2) Replace about 5–15% of IMPORTANT logic with blank REGIONS that remain identifiable after the student edits. " +
+          "Each blank region MUST be wrapped by two exact tokens: __LC_BLANK_<id>_START__ and __LC_BLANK_<id>_END__. " +
+          "The student-editable placeholder content must appear BETWEEN these two tokens. " +
+          "Markers MUST appear on their own lines as standalone comments containing only the token (plus comment delimiters). Do not place marker tokens inline with code. " +
+          "Do NOT use generic TODO comments. Do NOT use __BLANK__. " +
+          "(3) Every blank region MUST have a corresponding entry in the 'blanks' array. The 'id' must exactly match the wrapper token suffix (e.g. validateInput). " +
+          "(4) The 'path' field in each blank must match the file where the region appears. " +
+          "(5) The 'solution' field must contain ONLY the exact code that replaces the placeholder content BETWEEN the START and END tokens. " +
+          "Do NOT include the wrapper tokens in solution. Do NOT include markdown fences. Do NOT include explanation inside the solution. Code only. " +
+          // ---- INSERTED rules (5b) and (5c) here ----
+          "(5b) COMMENT STYLE: The START/END marker lines must use the correct comment syntax for each file type: " +
+          "HTML (.html/.htm/.svg): <!-- __LC_BLANK_<id>_START__ --> and <!-- __LC_BLANK_<id>_END__ -->. " +
+          "CSS (.css): /* __LC_BLANK_<id>_START__ */ and /* __LC_BLANK_<id>_END__ */. " +
+          "JS/TS (.js/.ts/.jsx/.tsx/.mjs/.cjs): // __LC_BLANK_<id>_START__ and // __LC_BLANK_<id>_END__ (or /* ... */). " +
+          "Python (.py): # __LC_BLANK_<id>_START__ and # __LC_BLANK_<id>_END__. " +
+          "Each marker MUST be on its own line and contain ONLY the token (plus comment delimiters). " +
+          "(5c) The placeholder content BETWEEN START and END MUST be incomplete/incorrect compared to solution (i.e., not equal to the solution). The scaffold must require student edits to become fully working. " +
+          // ---- end inserted ----
+          "(6) 'hint' should guide the student without revealing the solution. " +
+          "(7) 'explanation' should briefly explain what the solution does and why it is correct. " +
+          "(8) exercisesMd must reference the entire project, explicitly refer to blank IDs, and include a section titled 'Comprehension Questions'. " +
+          "In that section, include at least 5 questions, EACH tagged with a stable identifier like [CQ1], [CQ2], ... (include the tag literally in the question line). " +
+          "(9) answerKeyMd must be an INSTRUCTOR KEY that includes: (a) each blank with its id, path, solution, and explanation; and (b) a section titled 'Comprehension Answers' that answers EVERY comprehension question. " +
+          "Each answer MUST repeat the same tag, e.g. '[CQ1] ...answer...'. " +
+          "(10) Do NOT remove import statements, package declarations, or file-level boilerplate unless pedagogically critical." +
+          "Input files (JSON array): " +
+          JSON.stringify(filePayload);
 
-  // Scaffold output validation and single repair pass
-  const parsed = parseScaffoldPlan(stdout);
-  const issues = validateScaffoldPlan(parsed);
-  if (issues.length > 0) {
-    output.appendLine("\n--- Scaffold validation issues detected; attempting one repair pass ---");
-    output.appendLine(formatScaffoldIssuesForPrompt(issues));
+        progress.report({ message: "Asking Copilot CLI…" });
+        setBusyStatus("Waiting for Copilot CLI");
 
-    // Ask Copilot to repair only the scaffold output (maskedFiles/blanks/exercises/answerKey) given the same input files.
-    const repairPrompt =
-      "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
-      "You previously produced an invalid learning scaffold. Fix it. " +
-      "Output schema MUST remain: {\"maskedFiles\":[{\"path\":string,\"content\":string}],\"blanks\":[{\"id\":string,\"path\":string,\"solution\":string,\"hint\":string?,\"explanation\":string?}],\"exercisesMd\":string,\"answerKeyMd\":string?,\"notes\":string?}. " +
-      "Fix ALL of these validation issues:\n" +
-      formatScaffoldIssuesForPrompt(issues) +
-      "\n\nRules to follow: " +
-      "- Use correct per-file comment syntax for marker lines (HTML uses <!-- -->, CSS uses /* */, JS uses // or /* */, etc.). " +
-      "- Markers must be on their own lines and contain only the token + comment delimiters. " +
-      "- Placeholder between markers must NOT equal the solution; it must be incomplete so the student must edit. " +
-      "- maskedFiles may only include input paths. " +
-      "- exercisesMd must include comprehension questions tagged [CQ1].. and answerKeyMd must include a 'Comprehension Answers' section with matching tags. " +
-      "Input files (JSON array): " +
-      JSON.stringify(filePayload);
+        const res = await runCopilotPrompt(
+          copilotPath,
+          copilotArgs,
+          storageDir,
+          scaffoldPrompt,
+          configDir,
+          logDir,
+          output,
+          envOverride
+        );
 
-    const repairRes = await runCopilotPrompt(
-      copilotPath,
-      copilotArgs,
-      storageDir,
-      repairPrompt,
-      configDir,
-      logDir,
-      output,
-      envOverride
-    );
+        const stderr = res.stderr.trim();
+        const stdout = res.stdout.trim();
 
-    const repairStdout = repairRes.stdout.trim();
-    if (repairRes.exitCode !== 0) {
-      throw new Error(repairRes.stderr.trim() || `Copilot scaffold repair failed (exit ${repairRes.exitCode}).`);
+        if (res.exitCode !== 0) {
+          throw new Error(stderr || `Copilot scaffold generation failed (exit ${res.exitCode}).`);
+        }
+        if (!stdout) {
+          throw new Error("Copilot scaffold generation returned empty stdout.");
+        }
+
+        progress.report({ message: "Parsing scaffold…" });
+        const parsed = parseScaffoldPlan(stdout);
+        
+        progress.report({ message: "Validating scaffold…" });
+        const issues = validateScaffoldPlan(parsed);
+  
+        if (issues.length > 0) {
+          progress.report({ message: "Scaffold needs repair…" });
+          setBusyStatus("Repairing scaffold");
+          
+          output.appendLine("\n--- Scaffold validation issues detected; attempting one repair pass ---");
+          output.appendLine(formatScaffoldIssuesForPrompt(issues));
+
+          // Ask Copilot to repair only the scaffold output (maskedFiles/blanks/exercises/answerKey) given the same input files.
+          const repairPrompt =
+            "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
+            "You previously produced an invalid learning scaffold. Fix it. " +
+            "Output schema MUST remain: {\"maskedFiles\":[{\"path\":string,\"content\":string}],\"blanks\":[{\"id\":string,\"path\":string,\"solution\":string,\"hint\":string?,\"explanation\":string?}],\"exercisesMd\":string,\"answerKeyMd\":string?,\"notes\":string?}. " +
+            "Fix ALL of these validation issues:\n" +
+            formatScaffoldIssuesForPrompt(issues) +
+            "\n\nRules to follow: " +
+            "- Use correct per-file comment syntax for marker lines (HTML uses <!-- -->, CSS uses /* */, JS uses // or /* */, etc.). " +
+            "- Markers must be on their own lines and contain only the token + comment delimiters. " +
+            "- Placeholder between markers must NOT equal the solution; it must be incomplete so the student must edit. " +
+            "- maskedFiles may only include input paths. " +
+            "- exercisesMd must include comprehension questions tagged [CQ1].. and answerKeyMd must include a 'Comprehension Answers' section with matching tags. " +
+            "Input files (JSON array): " +
+            JSON.stringify(filePayload);
+          
+          progress.report({ message: "Asking Copilot CLI (repair)…" });
+          const repairRes = await runCopilotPrompt(
+            copilotPath,
+            copilotArgs,
+            storageDir,
+            repairPrompt,
+            configDir,
+            logDir,
+            output,
+            envOverride
+          );
+
+          const repairStdout = repairRes.stdout.trim();
+          if (repairRes.exitCode !== 0) {
+            throw new Error(repairRes.stderr.trim() || `Copilot scaffold repair failed (exit ${repairRes.exitCode}).`);
+          }
+          if (!repairStdout) {
+            throw new Error("Copilot scaffold repair returned empty stdout.");
+          }
+
+          const repaired = parseScaffoldPlan(repairStdout);
+          const issues2 = validateScaffoldPlan(repaired);
+          if (issues2.length > 0) {
+            output.appendLine("\n--- Scaffold repair still has issues (returning repaired output anyway). ---");
+            output.appendLine(formatScaffoldIssuesForPrompt(issues2));
+            setBusyStatus(null);
+            return repaired;
+          }
+
+          setBusyStatus(null);
+          output.appendLine("\n--- Scaffold repair succeeded. ---");
+          return repaired;
+        }
+        setBusyStatus(null);
+        return parsed;
+      } catch (err) {
+        setBusyStatus(null);
+        throw err;
+      } finally {
+        try { if (hb) { clearInterval(hb); } } catch {}
+        setBusyStatus(null);
+      }
     }
-    if (!repairStdout) {
-      throw new Error("Copilot scaffold repair returned empty stdout.");
-    }
-
-    const repaired = parseScaffoldPlan(repairStdout);
-    const issues2 = validateScaffoldPlan(repaired);
-    if (issues2.length > 0) {
-      output.appendLine("\n--- Scaffold repair still has issues (returning repaired output anyway). ---");
-      output.appendLine(formatScaffoldIssuesForPrompt(issues2));
-      return repaired;
-    }
-
-    output.appendLine("\n--- Scaffold repair succeeded. ---");
-    return repaired;
-  }
-
-  return parsed;
+  );      
 }
 
 async function generateLearningScaffoldFocused(
@@ -1494,158 +1626,205 @@ async function generateLearningScaffoldFocused(
   output: vscode.OutputChannel,
   envOverride: NodeJS.ProcessEnv
 ): Promise<ScaffoldPlan> {
-  const MAX_CHARS_PER_FILE = 12000;
+  return await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "Learning Copilot: Generating focused learning scaffold…",
+      cancellable: false,
+    },
+    async (progress) => {
+      let hb: NodeJS.Timeout | undefined;
+      let hbTick = 0;
+      try {
+        setBusyStatus("Generating focused scaffold");
+        progress.report({ message: "Preparing focused prompt…" });
 
-  const focusPayload = focusFiles.map((f) => ({
-    path: f.rel,
-    changedRanges: f.changedRanges,
-    changedRangesHuman: formatRangesForPrompt(f.changedRanges),
-    content:
-      f.fullContent.length > MAX_CHARS_PER_FILE
-        ? f.fullContent.slice(0, MAX_CHARS_PER_FILE) + "\n\n/* TRUNCATED */\n"
-        : f.fullContent,
-    oldContent:
-      f.oldContent.length > MAX_CHARS_PER_FILE
-        ? f.oldContent.slice(0, MAX_CHARS_PER_FILE) + "\n\n/* TRUNCATED */\n"
-        : f.oldContent,
-  }));
+        // Ensure the user can see logs during long scaffold runs.
+        output.show(true);
 
-  const contextPayload = contextFiles.map((f) => ({
-    path: f.path,
-    content:
-      f.content.length > MAX_CHARS_PER_FILE
-        ? f.content.slice(0, MAX_CHARS_PER_FILE) + "\n\n/* TRUNCATED */\n"
-        : f.content,
-  }));
+        // Heartbeat: keep progress UI visibly updating during long waits.
+        hbTick = 0;
+        hb = setInterval(() => {
+          hbTick++;
+          progress.report({
+            increment: 1,
+            message: hbTick % 3 === 0 ? "Still working…" : undefined,
+          });
+        }, 5000);
 
-  const scaffoldPrompt =
-    "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
-    "You are a teaching assistant. Create a LEARNING SCAFFOLD focused ONLY on the NEW or MODIFIED functionality. " +
-    "You will be given (A) focusFiles: the files that were created/changed, and (B) contextFiles: the broader workspace for reference. " +
-    "Output schema: " +
-    "{\"maskedFiles\":[{\"path\":string,\"content\":string}]," +
-    "\"blanks\":[{\"id\":string,\"path\":string,\"solution\":string,\"hint\":string?,\"explanation\":string?}]," +
-    "\"exercisesMd\":string,\"answerKeyMd\":string?,\"notes\":string?}. " +
-    "STRICT RULES: " +
-    "(1) maskedFiles MUST include ONLY files listed in focusFiles (same paths). Do NOT include other files in maskedFiles. " +
-    "(2) Blanks MUST appear ONLY in focusFiles. Do NOT add blanks to other files. " +
-    "(3) CRITICAL: Each focus file includes 'changedRanges' (line ranges in the NEW content). You MUST place blank regions ONLY within these changedRanges. Do NOT place blanks outside changedRanges. " +
-    "(4) Replace about 5–15% of IMPORTANT logic related to the new/modified functionality with blank REGIONS that remain identifiable after the student edits. " +
-    "Each blank region MUST be wrapped by two exact tokens: __LC_BLANK_<id>_START__ and __LC_BLANK_<id>_END__. " +
-    "The student-editable placeholder content must appear BETWEEN these two tokens. " +
-    "Markers MUST appear on their own lines as standalone comments containing only the token (plus comment delimiters). Do not place marker tokens inline with code. " +
-    "(5) Every blank region MUST have a corresponding entry in the 'blanks' array. " +
-    "(6) 'solution' must be ONLY the replacement code between markers (no tokens). " +
-    "(7) COMMENT STYLE for marker lines must match file type (HTML uses <!-- -->, CSS uses /* */, JS uses // or /* */, Python uses #). " +
-    "(8) Placeholder between markers MUST be incomplete/incorrect compared to solution. " +
-    "(9) exercisesMd must focus on the new/modified functionality, reference blank IDs, and include a section titled 'Comprehension Questions'. " +
-    "In that section, include at least 5 questions, EACH tagged with a stable identifier like [CQ1], [CQ2], ... (include the tag literally in the question line). " +
-    "(10) answerKeyMd must include: (a) each blank (id/path/solution/explanation) and (b) a section titled 'Comprehension Answers' that answers EVERY comprehension question. " +
-    "Each answer MUST repeat the same tag, e.g. '[CQ1] ...answer...'. " +
-    "(11) IMPORTANT: If changedRanges is empty for a file, do not place blanks in that file. " +
-    "Focus files (JSON array): " +
-    JSON.stringify(focusPayload) +
-    "\n\nContext files (JSON array): " +
-    JSON.stringify(contextPayload);
+        const MAX_CHARS_PER_FILE = 12000;
 
-  const res = await runCopilotPrompt(
-    copilotPath,
-    copilotArgs,
-    storageDir,
-    scaffoldPrompt,
-    configDir,
-    logDir,
-    output,
-    envOverride
-  );
+        const focusPayload = focusFiles.map((f) => ({
+          path: f.rel,
+          changedRanges: f.changedRanges,
+          changedRangesHuman: formatRangesForPrompt(f.changedRanges),
+          content:
+            f.fullContent.length > MAX_CHARS_PER_FILE
+              ? f.fullContent.slice(0, MAX_CHARS_PER_FILE) + "\n\n/* TRUNCATED */\n"
+              : f.fullContent,
+          oldContent:
+            f.oldContent.length > MAX_CHARS_PER_FILE
+              ? f.oldContent.slice(0, MAX_CHARS_PER_FILE) + "\n\n/* TRUNCATED */\n"
+              : f.oldContent,
+        }));
 
-  const stderr = res.stderr.trim();
-  const stdout = res.stdout.trim();
+        const contextPayload = contextFiles.map((f) => ({
+          path: f.path,
+          content:
+            f.content.length > MAX_CHARS_PER_FILE
+              ? f.content.slice(0, MAX_CHARS_PER_FILE) + "\n\n/* TRUNCATED */\n"
+              : f.content,
+        }));
 
-  if (res.exitCode !== 0) {
-    throw new Error(stderr || `Copilot scaffold generation failed (exit ${res.exitCode}).`);
-  }
-  if (!stdout) {
-    throw new Error("Copilot scaffold generation returned empty stdout.");
-  }
+        const scaffoldPrompt =
+          "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
+          "You are a teaching assistant. Create a LEARNING SCAFFOLD focused ONLY on the NEW or MODIFIED functionality. " +
+          "You will be given (A) focusFiles: the files that were created/changed, and (B) contextFiles: the broader workspace for reference. " +
+          "Output schema: " +
+          "{\"maskedFiles\":[{\"path\":string,\"content\":string}]," +
+          "\"blanks\":[{\"id\":string,\"path\":string,\"solution\":string,\"hint\":string?,\"explanation\":string?}]," +
+          "\"exercisesMd\":string,\"answerKeyMd\":string?,\"notes\":string?}. " +
+          "STRICT RULES: " +
+          "(1) maskedFiles MUST include ONLY files listed in focusFiles (same paths). Do NOT include other files in maskedFiles. " +
+          "(2) Blanks MUST appear ONLY in focusFiles. Do NOT add blanks to other files. " +
+          "(3) CRITICAL: Each focus file includes 'changedRanges' (line ranges in the NEW content). You MUST place blank regions ONLY within these changedRanges. Do NOT place blanks outside changedRanges. " +
+          "(4) Replace about 5–15% of IMPORTANT logic related to the new/modified functionality with blank REGIONS that remain identifiable after the student edits. " +
+          "Each blank region MUST be wrapped by two exact tokens: __LC_BLANK_<id>_START__ and __LC_BLANK_<id>_END__. " +
+          "The student-editable placeholder content must appear BETWEEN these two tokens. " +
+          "Markers MUST appear on their own lines as standalone comments containing only the token (plus comment delimiters). Do not place marker tokens inline with code. " +
+          "(5) Every blank region MUST have a corresponding entry in the 'blanks' array. " +
+          "(6) 'solution' must be ONLY the replacement code between markers (no tokens). " +
+          "(7) COMMENT STYLE for marker lines must match file type (HTML uses <!-- -->, CSS uses /* */, JS uses // or /* */, Python uses #). " +
+          "(8) Placeholder between markers MUST be incomplete/incorrect compared to solution. " +
+          "(9) exercisesMd must focus on the new/modified functionality, reference blank IDs, and include a section titled 'Comprehension Questions'. " +
+          "In that section, include at least 5 questions, EACH tagged with a stable identifier like [CQ1], [CQ2], ... (include the tag literally in the question line). " +
+          "(10) answerKeyMd must include: (a) each blank (id/path/solution/explanation) and (b) a section titled 'Comprehension Answers' that answers EVERY comprehension question. " +
+          "Each answer MUST repeat the same tag, e.g. '[CQ1] ...answer...'. " +
+          "(11) IMPORTANT: If changedRanges is empty for a file, do not place blanks in that file. " +
+          "Focus files (JSON array): " +
+          JSON.stringify(focusPayload) +
+          "\n\nContext files (JSON array): " +
+          JSON.stringify(contextPayload);
 
-  const parsed = parseScaffoldPlan(stdout);
-  const issues = validateScaffoldPlan(parsed);
+        progress.report({ message: "Asking Copilot CLI…" });
+        setBusyStatus("Waiting for Copilot CLI");
 
-  // Additional focused validation: blank regions must start within changedRanges.
-  const byRel = new Map<string, FocusFileWithDiff>();
-  for (const f of focusFiles) { byRel.set(normalizeRelativePath(f.rel), f); }
+        const res = await runCopilotPrompt(
+          copilotPath,
+          copilotArgs,
+          storageDir,
+          scaffoldPrompt,
+          configDir,
+          logDir,
+          output,
+          envOverride
+        );
 
-  for (const mf of parsed.maskedFiles) {
-    let rel: string;
-    try { rel = normalizeRelativePath(mf.path); } catch { continue; }
+        const stderr = res.stderr.trim();
+        const stdout = res.stdout.trim();
 
-    const meta = byRel.get(rel);
-    if (!meta) {continue;}
+        if (res.exitCode !== 0) {
+          setBusyStatus(null);
+          throw new Error(stderr || `Copilot scaffold generation failed (exit ${res.exitCode}).`);
+        }
+        if (!stdout) {
+          setBusyStatus(null);
+          throw new Error("Copilot scaffold generation returned empty stdout.");
+        }
 
-    const regions = listBlankRegions(mf.content);
-    for (const r of regions) {
-      const startLine = getRegionStartLine(mf.content, r.startTokenStart);
-      if (!isLineWithinRanges(startLine, meta.changedRanges)) {
-        issues.push({
-          kind: "blankAlreadySolved" as any, // reuse an issue kind to force repair
-          file: rel,
-          id: r.id,
-          detail: `Blank ${r.id} starts at line ${startLine} in ${rel}, OUTSIDE changedRanges ${formatRangesForPrompt(meta.changedRanges)}. Move blanks inside changedRanges only.`,
-        });
+        progress.report({ message: "Parsing focused scaffold…" });
+        const parsed = parseScaffoldPlan(stdout);
+        progress.report({ message: "Validating focused scaffold…" });
+        const issues = validateScaffoldPlan(parsed);
+
+        // Additional focused validation: blank regions must start within changedRanges.
+        const byRel = new Map<string, FocusFileWithDiff>();
+        for (const f of focusFiles) { byRel.set(normalizeRelativePath(f.rel), f); }
+
+        for (const mf of parsed.maskedFiles) {
+          let rel: string;
+          try { rel = normalizeRelativePath(mf.path); } catch { continue; }
+
+          const meta = byRel.get(rel);
+          if (!meta) {continue;}
+
+          const regions = listBlankRegions(mf.content);
+          for (const r of regions) {
+            const startLine = getRegionStartLine(mf.content, r.startTokenStart);
+            if (!isLineWithinRanges(startLine, meta.changedRanges)) {
+              issues.push({
+                kind: "blankAlreadySolved" as any, // reuse an issue kind to force repair
+                file: rel,
+                id: r.id,
+                detail: `Blank ${r.id} starts at line ${startLine} in ${rel}, OUTSIDE changedRanges ${formatRangesForPrompt(meta.changedRanges)}. Move blanks inside changedRanges only.`,
+              });
+            }
+          }
+        }
+
+        if (issues.length > 0) {
+          progress.report({ message: "Focused scaffold needs repair…" });
+          setBusyStatus("Repairing focused scaffold");
+          output.appendLine("\n--- Focused scaffold validation issues detected; attempting one repair pass ---");
+          output.appendLine(formatScaffoldIssuesForPrompt(issues));
+
+          const repairPrompt =
+            "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
+            "You previously produced an invalid focused learning scaffold. Fix it. " +
+            "Output schema MUST remain: {\"maskedFiles\":[{\"path\":string,\"content\":string}],\"blanks\":[{\"id\":string,\"path\":string,\"solution\":string,\"hint\":string?,\"explanation\":string?}],\"exercisesMd\":string,\"answerKeyMd\":string?,\"notes\":string?}. " +
+            "Fix ALL of these validation issues:\n" +
+            formatScaffoldIssuesForPrompt(issues) +
+            "\n\nRules: maskedFiles/blanks must stay restricted to focusFiles. Use correct marker comment style. Placeholder must differ from solution. " +
+            "- exercisesMd must include comprehension questions tagged [CQ1].. and answerKeyMd must include a 'Comprehension Answers' section with matching tags. " +
+            "Focus files (JSON array): " +
+            JSON.stringify(focusPayload) +
+            "\n\nContext files (JSON array): " +
+            JSON.stringify(contextPayload);
+
+          progress.report({ message: "Asking Copilot CLI (focused repair)…" });
+          setBusyStatus("Waiting for Copilot CLI");
+          const repairRes = await runCopilotPrompt(
+            copilotPath,
+            copilotArgs,
+            storageDir,
+            repairPrompt,
+            configDir,
+            logDir,
+            output,
+            envOverride
+          );
+
+          const repairStdout = repairRes.stdout.trim();
+          if (repairRes.exitCode !== 0) {
+            setBusyStatus(null);
+            throw new Error(repairRes.stderr.trim() || `Copilot scaffold repair failed (exit ${repairRes.exitCode}).`);
+          }
+          if (!repairStdout) {
+            setBusyStatus(null);
+            throw new Error("Copilot scaffold repair returned empty stdout.");
+          }
+
+          const repaired = parseScaffoldPlan(repairStdout);
+          const issues2 = validateScaffoldPlan(repaired);
+          if (issues2.length > 0) {
+            output.appendLine("\n--- Focused scaffold repair still has issues (returning repaired output anyway). ---");
+            output.appendLine(formatScaffoldIssuesForPrompt(issues2));
+            setBusyStatus(null);
+            return repaired;
+          }
+
+          setBusyStatus(null);
+          output.appendLine("\n--- Focused scaffold repair succeeded. ---");
+          return repaired;
+        }
+        setBusyStatus(null);
+        return parsed;
+      } finally {
+        try { if (hb) { clearInterval(hb); } } catch {}
+        setBusyStatus(null);
       }
     }
-  }
-
-  if (issues.length > 0) {
-    output.appendLine("\n--- Focused scaffold validation issues detected; attempting one repair pass ---");
-    output.appendLine(formatScaffoldIssuesForPrompt(issues));
-
-    const repairPrompt =
-      "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
-      "You previously produced an invalid focused learning scaffold. Fix it. " +
-      "Output schema MUST remain: {\"maskedFiles\":[{\"path\":string,\"content\":string}],\"blanks\":[{\"id\":string,\"path\":string,\"solution\":string,\"hint\":string?,\"explanation\":string?}],\"exercisesMd\":string,\"answerKeyMd\":string?,\"notes\":string?}. " +
-      "Fix ALL of these validation issues:\n" +
-      formatScaffoldIssuesForPrompt(issues) +
-      "\n\nRules: maskedFiles/blanks must stay restricted to focusFiles. Use correct marker comment style. Placeholder must differ from solution. " +
-      "- exercisesMd must include comprehension questions tagged [CQ1].. and answerKeyMd must include a 'Comprehension Answers' section with matching tags. " +
-      "Focus files (JSON array): " +
-      JSON.stringify(focusPayload) +
-      "\n\nContext files (JSON array): " +
-      JSON.stringify(contextPayload);
-
-    const repairRes = await runCopilotPrompt(
-      copilotPath,
-      copilotArgs,
-      storageDir,
-      repairPrompt,
-      configDir,
-      logDir,
-      output,
-      envOverride
-    );
-
-    const repairStdout = repairRes.stdout.trim();
-    if (repairRes.exitCode !== 0) {
-      throw new Error(repairRes.stderr.trim() || `Copilot scaffold repair failed (exit ${repairRes.exitCode}).`);
-    }
-    if (!repairStdout) {
-      throw new Error("Copilot scaffold repair returned empty stdout.");
-    }
-
-    const repaired = parseScaffoldPlan(repairStdout);
-    const issues2 = validateScaffoldPlan(repaired);
-    if (issues2.length > 0) {
-      output.appendLine("\n--- Focused scaffold repair still has issues (returning repaired output anyway). ---");
-      output.appendLine(formatScaffoldIssuesForPrompt(issues2));
-      return repaired;
-    }
-
-    output.appendLine("\n--- Focused scaffold repair succeeded. ---");
-    return repaired;
-  }
-
-  return parsed;
+  );
 }
 
 /**
@@ -1656,6 +1835,13 @@ async function generateLearningScaffoldFocused(
 export async function activate(context: vscode.ExtensionContext) {
   const output = vscode.window.createOutputChannel("Learning Copilot");
   context.subscriptions.push(output);
+
+  statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+  statusBar.command = "workbench.action.output.toggleOutput";
+  statusBar.text = "$(check) Learning Copilot";
+  statusBar.tooltip = "Learning Copilot";
+  statusBar.hide();
+  context.subscriptions.push(statusBar);
 
   // Provide in-memory documents for diff previews (proposed/artifact content).
   context.subscriptions.push(
@@ -1690,218 +1876,6 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Generate Exercise from Prompt  
-  context.subscriptions.push(
-    vscode.commands.registerCommand("learningCopilot.generateExercisePrompt", async () => {
-      const { copilotPath, copilotArgs } = getConfig();
-      const storageDir = await ensureStorageDir(context);
-      const logDir = path.join(storageDir, "copilot-logs");
-      const configDir = path.join(storageDir, "copilot-config");
-      await fsp.mkdir(logDir, { recursive: true });
-      await fsp.mkdir(configDir, { recursive: true });
-
-      const prompt = await vscode.window.showInputBox({
-        title: "Learning Copilot: Exercise prompt",
-        placeHolder: "e.g., Write a short programming exercise about recursion (no solution).",
-      });
-      if (!prompt) {return; }
-      
-      output.show(true);
-      
-      try {
-        const token = await getVsCodeGitHubToken();
-        const envOverride: NodeJS.ProcessEnv = token
-          ? {
-              COPILOT_GITHUB_TOKEN: token,
-              GH_TOKEN: token,
-              GITHUB_TOKEN: token,
-            }
-          : {};
-        const res = await runCopilotPrompt(copilotPath, copilotArgs, storageDir, prompt, configDir, logDir, output, envOverride);
-        
-        const stderr = res.stderr.trim();
-        const stdout = res.stdout.trim();
-        
-        // If Copilot CLI failed, handle it here (it doesn't throw).
-        if (res.exitCode !== 0) {
-          if (stderr.toLowerCase().includes("no authentication information found")) {
-            const choice = await vscode.window.showErrorMessage(
-              "Copilot CLI is installed but not logged in. Open a terminal to run /login now?",
-              "Login",
-              "Cancel"
-            );
-            if (choice === "Login") {
-              await vscode.commands.executeCommand("learningCopilot.loginCopilotCli");
-            }
-            return;
-          }
-          if (
-            stderr.toLowerCase().includes("failed to list models") ||
-            stderr.toLowerCase().includes("failed to fetch models") ||
-            stderr.toLowerCase().includes("fetch failed")
-          ) {
-            vscode.window.showErrorMessage(
-              "Copilot CLI could not list models. This is usually an auth/token issue or a network/proxy/TLS issue inside Copilot CLI. " +
-                "If you just signed into GitHub in VS Code, try the command again. Otherwise, open the Learning Copilot output and check the log tail."
-            );
-            return;
-          }
-          
-          vscode.window.showErrorMessage(`Copilot CLI failed (exit ${res.exitCode}). See Output for details.`);
-          if (stderr) {
-            output.appendLine("--- stderr ---");
-            output.appendLine(stderr);
-          }
-          return;
-        }
-        
-        if (stderr) {
-          output.appendLine("--- stderr ---");
-          output.appendLine(stderr);
-        }
-        
-        output.appendLine("--- stdout ---");
-        output.appendLine(stdout);
-        
-        lastOutput = stdout || null;
-        
-        if (!lastOutput) {
-          vscode.window.showWarningMessage("Copilot returned no output (stdout was empty).");
-        } else {
-          vscode.window.showInformationMessage(
-            "Exercise generated. Use “Learning Copilot: Save Last Output” to save."
-          );
-        }
-      } catch (err: any) {
-        const msg = err?.message ?? String(err);
-        const lower = msg.toLowerCase();
-        if (lower.includes("no authentication information found")) {
-          const choice = await vscode.window.showErrorMessage(
-            "Copilot CLI is installed but not logged in. Open a terminal to run /login now?",
-            "Login",
-            "Cancel"
-          );
-          if (choice === "Login") {
-            await vscode.commands.executeCommand("learningCopilot.loginCopilotCli");
-          }
-          return;
-        }
-        vscode.window.showErrorMessage(`Failed to run Copilot CLI: ${msg}`);
-      }
-    })
-  );
-
-  // Generate Exercise from Selection
-  context.subscriptions.push(
-    vscode.commands.registerCommand("learningCopilot.generateExerciseSelection", async () => {
-      const editor = vscode.window.activeTextEditor;
-      if (!editor) {return; }
-      
-      const selectionText = editor.document.getText(editor.selection).trim();
-      if (!selectionText) {
-        vscode.window.showWarningMessage("Select some code first.");
-        return;
-      }
-      
-      const { copilotPath, copilotArgs } = getConfig();
-      const storageDir = await ensureStorageDir(context);
-      const logDir = path.join(storageDir, "copilot-logs");
-      const configDir = path.join(storageDir, "copilot-config");
-      await fsp.mkdir(logDir, { recursive: true });
-      await fsp.mkdir(configDir, { recursive: true });     
-    
-      const prompt =
-      `Create a programming exercise based on the following code/context.\n` +
-      `- The exercise should be solvable in 15–30 minutes.\n` +
-      `- Include clear requirements and at least 3 test cases.\n` +
-      `- Do NOT provide a full solution.\n\n` +
-      `Context:\n` +
-      "```text\n" +
-      selectionText +
-      "\n```\n";
-      
-      output.show(true);
-      
-      try {
-        const token = await getVsCodeGitHubToken();
-        const envOverride: NodeJS.ProcessEnv = token
-          ? {
-              COPILOT_GITHUB_TOKEN: token,
-              GH_TOKEN: token,
-              GITHUB_TOKEN: token,
-            }
-          : {};
-        const res = await runCopilotPrompt(copilotPath, copilotArgs, storageDir, prompt, configDir,logDir, output, envOverride);
-        const stderr = res.stderr.trim();
-        const stdout = res.stdout.trim();
-        
-        // If Copilot CLI failed, handle it here (it doesn't throw).
-        if (res.exitCode !== 0) {
-          if (stderr.toLowerCase().includes("no authentication information found")) {
-            const choice = await vscode.window.showErrorMessage(
-              "Copilot CLI is installed but not logged in. Open a terminal to run /login now?",
-              "Login",
-              "Cancel"
-            );
-            if (choice === "Login") {
-              await vscode.commands.executeCommand("learningCopilot.loginCopilotCli");
-            }
-            return;
-          }
-          if (
-            stderr.toLowerCase().includes("failed to list models") ||
-            stderr.toLowerCase().includes("failed to fetch models") ||
-            stderr.toLowerCase().includes("fetch failed")
-          ) {
-            vscode.window.showErrorMessage(
-              "Copilot CLI could not list models. This is usually an auth/token issue or a network/proxy/TLS issue inside Copilot CLI. " +
-                "If you just signed into GitHub in VS Code, try the command again. Otherwise, open the Learning Copilot output and check the log tail."
-            );
-            return;
-          }
-          
-          vscode.window.showErrorMessage(`Copilot CLI failed (exit ${res.exitCode}). See Output for details.`);
-          if (stderr) {
-            output.appendLine("--- stderr ---");
-            output.appendLine(stderr);
-          }
-          return;
-        }
-        
-        if (stderr) {
-          output.appendLine("--- stderr ---");
-          output.appendLine(stderr);
-        }
-        
-        output.appendLine("--- stdout ---");
-        output.appendLine(stdout);
-        
-        lastOutput = stdout || null;
-        
-        if (!lastOutput) {
-          vscode.window.showWarningMessage("Copilot returned no output (stdout was empty).");
-        } else {
-          vscode.window.showInformationMessage("Exercise generated from selection.");
-        }
-      } catch (err: any) {
-        const msg = err?.message ?? String(err);
-        const lower = msg.toLowerCase();
-        if (lower.includes("no authentication information found")) {
-          const choice = await vscode.window.showErrorMessage(
-            "Copilot CLI is installed but not logged in. Open a terminal to run /login now?",
-            "Login",
-            "Cancel"
-          );
-          if (choice === "Login") {
-            await vscode.commands.executeCommand("learningCopilot.loginCopilotCli");
-          }
-          return;
-        }
-        vscode.window.showErrorMessage(`Failed to run Copilot CLI: ${msg}`);
-      }
-    })
-  );
-    
   // Save Last Output
   context.subscriptions.push(
     vscode.commands.registerCommand("learningCopilot.saveLastOutput", async () => {
@@ -2351,7 +2325,7 @@ export async function activate(context: vscode.ExtensionContext) {
         );
       }
 
-      const range = getEditableRangeForRegion(editor.document, hit);
+      // const range = getEditableRangeForRegion(editor.document, hit);
       
       const blank = getBlankById(context, rel, hit.id);
       if (!blank) { return vscode.window.showErrorMessage(`No stored solution mapping for blank id: ${hit.id}`); }
@@ -2360,8 +2334,10 @@ export async function activate(context: vscode.ExtensionContext) {
       // Our replacement range ends at the start of the END marker line, so if the inserted
       // solution doesn't end with a newline, the END marker would end up on the same line.
       const insert = blank.solution.endsWith("\n") ? blank.solution : blank.solution + "\n";
-      await editor.edit((eb) => eb.replace(range, insert));
-      vscode.window.showInformationMessage(`Applied solution for blank: ${hit.id}`);
+      // await editor.edit((eb) => eb.replace(range, insert));
+      
+      await applySolutionForRegion(editor, editor.document, hit, insert, true);
+      vscode.window.showInformationMessage(`Applied solution for blank ${hit.id} (markers removed).`);
     })
   );
  
@@ -2389,7 +2365,8 @@ export async function activate(context: vscode.ExtensionContext) {
       const insertLen = insert.length;
       const newPos = editor.document.positionAt(next.startTokenEnd + insertLen);
    
-      await editor.edit((eb) => eb.replace(range, insert));
+      //await editor.edit((eb) => eb.replace(range, insert));
+      await applySolutionForRegion(editor, editor.document, next, insert, true);
 
       editor.selection = new vscode.Selection(newPos, newPos);
       editor.revealRange(new vscode.Range(newPos, newPos));
