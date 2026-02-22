@@ -1,71 +1,96 @@
-# learning-copilot README
+# Learning Copilot
 
-This is the README for your extension "learning-copilot". After writing up a brief description, we recommend including the following sections.
+Learning Copilot is a VS Code extension that uses the GitHub Copilot CLI to:
 
-## Features
+- generate or modify real project files from a prompt
+- automatically convert those solutions into a guided learning scaffold
+- create `LEARNING_EXERCISES.md` plus an instructor-only answer key
+- let learners reveal hints or apply solutions for individual blanks
 
-Describe specific features of your extension including screenshots of your extension in action. Image paths are relative to this README file.
+## What It Does
 
-For example if there is an image subfolder under your extension project workspace:
+After code generation/modification, the extension can scaffold the result by:
 
-\!\[feature X\]\(images/feature-x.png\)
+- masking selected logic with typed blank markers (`__LC_BLANK_<id>_START__/END__`)
+- saving solution mappings (per blank id)
+- writing learner instructions to `LEARNING_EXERCISES.md`
+- saving private artifacts (full solution snapshots + answer keys) in extension storage
 
-> Tip: Many popular extensions utilize animations. This is an excellent way to show off your extension! We recommend short, focused animations that are easy to follow.
+It also supports:
+
+- side-by-side compare of current file vs saved solution snapshot
+- revealing/applied blank solutions at cursor or next blank
+- marking blanks done while keeping your own implementation
 
 ## Requirements
 
-If you have any requirements or dependencies, add a section describing those and how to install and configure them.
+- VS Code `^1.109.0`
+- GitHub Copilot CLI access (the extension can install it for you)
+- A GitHub account with Copilot entitlement
+- Open a workspace/folder before running commands
 
-## Extension Settings
+## Quick Start
 
-Include if your extension adds any VS Code settings through the `contributes.configuration` extension point.
+1. Open a project folder in VS Code.
+2. Run `Learning Copilot: Install/Setup Copilot CLI`.
+3. Run `Learning Copilot: Generate Code Files from Prompt` (new project) or `Learning Copilot: Modify Workspace From Prompt` (existing project).
+4. Preview and approve file writes.
+5. Choose `Generate` when prompted to build the learning scaffold.
+6. Work through blanks and exercises, then use blank commands as needed.
 
-For example:
+When authentication is missing, the extension prompts you to log in and opens a terminal flow for Copilot CLI login.
 
-This extension contributes the following settings:
+## Commands
 
-* `myExtension.enable`: Enable/disable this extension.
-* `myExtension.thing`: Set to `blah` to do something.
+- `Learning Copilot: Install/Setup Copilot CLI`
+- `Learning Copilot: Generate Code Files from Prompt`
+- `Learning Copilot: Modify Workspace From Prompt`
+- `Learning Copilot: Compare Active File With Solution`
+- `Learning Copilot: Apply Solution For Blank At Cursor`
+- `Learning Copilot: Apply Solution For Next Blank`
+- `Learning Copilot: Show Hint For Blank At Cursor`
+- `Learning Copilot: Mark Blank As Done At Cursor`
+- `Learning Copilot: Open Latest Answer Key`
+- `Learning Copilot: Save Last Output`
 
-## Known Issues
+## Settings
 
-Calling out known issues can help limit users opening duplicate issues against your extension.
+- `learningCopilot.copilotPath` (default: `copilot`)
+- `learningCopilot.autoInstallCopilotCli` (default: `true`)
+- `learningCopilot.copilotArgs` (default: `[]`)
 
-## Release Notes
+## Output and Storage
 
-Users appreciate release notes as you update your extension.
+- Learner-facing exercises are written to `LEARNING_EXERCISES.md` in your workspace.
+- Full solution snapshots and answer keys are stored in extension global storage.
+- Compare uses the latest snapshot and currently active file.
 
-### 1.0.0
+## Development
 
-Initial release of ...
+```bash
+npm install
+npm run compile
+```
 
-### 1.0.1
+Useful scripts:
 
-Fixed issue #.
+- `npm run watch`
+- `npm run lint`
+- `npm run check-types`
+- `npm test`
 
-### 1.1.0
+To run locally in VS Code:
 
-Added features X, Y, and Z.
+1. Open this repo.
+2. Press `F5` to launch an Extension Development Host.
+3. Run commands from the Command Palette.
 
----
+## Known Limitations
 
-## Following extension guidelines
+- Requires Copilot CLI availability and authentication.
+- Scaffold quality depends on model output and prompt complexity.
+- Snapshot/answer-key state is per extension storage, not per git branch.
 
-Ensure that you've read through the extensions guidelines and follow the best practices for creating your extension.
+## License
 
-* [Extension Guidelines](https://code.visualstudio.com/api/references/extension-guidelines)
-
-## Working with Markdown
-
-You can author your README using Visual Studio Code. Here are some useful editor keyboard shortcuts:
-
-* Split the editor (`Cmd+\` on macOS or `Ctrl+\` on Windows and Linux).
-* Toggle preview (`Shift+Cmd+V` on macOS or `Shift+Ctrl+V` on Windows and Linux).
-* Press `Ctrl+Space` (Windows, Linux, macOS) to see a list of Markdown snippets.
-
-## For more information
-
-* [Visual Studio Code's Markdown Support](http://code.visualstudio.com/docs/languages/markdown)
-* [Markdown Syntax Reference](https://help.github.com/articles/markdown-basics/)
-
-**Enjoy!**
+See `LICENSE` if provided in this repository.
