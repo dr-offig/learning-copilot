@@ -40,8 +40,18 @@ function reportActivity(
   if (progress) {
     progress.report({ message: decorated, increment });
   }
-  output.appendLine(`[${elapsed}] ${message}`);
+  output.appendLine(`[workflow ${elapsed}] ${message}`);
   setBusyStatus(busyText ?? message);
+}
+
+function logDuration(
+  output: vscode.OutputChannel,
+  label: string,
+  startedAt: number,
+  details?: string
+) {
+  const elapsed = formatElapsedMs(Date.now() - startedAt);
+  output.appendLine(`[call ${elapsed}] ${label}${details ? ` - ${details}` : ""}`);
 }
 
 const proposedContent = new Map<string, string>();
@@ -730,11 +740,13 @@ function runCopilotPrompt(
   configDir: string,
   logDir: string,
   output: vscode.OutputChannel,
-  envOverride?: NodeJS.ProcessEnv
+  envOverride?: NodeJS.ProcessEnv,
+  traceLabel = "Copilot CLI call"
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
   void configDir;
   void logDir;
   return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
     const effectiveArgs = [...args, "-p", prompt];
     const proc = spawn(copilotPath, effectiveArgs, {
       cwd,
@@ -767,6 +779,12 @@ function runCopilotPrompt(
           }
         }
       }
+      logDuration(
+        output,
+        traceLabel,
+        startedAt,
+        `exit=${exitCode ?? "null"}, promptChars=${prompt.length}, stdoutChars=${stdout.length}, stderrChars=${stderr.length}`
+      );
       resolve({ stdout, stderr, exitCode });
     });
     
@@ -1252,6 +1270,7 @@ type WorkspaceFileContext = { path: string; content: string; truncated?: boolean
  * - Truncates per-file content and total payload size
  */
 async function collectWorkspaceContext(wsRoot: vscode.Uri, output: vscode.OutputChannel): Promise<WorkspaceFileContext[]> {
+  const startedAt = Date.now();
   const MAX_FILES = 80;
   const MAX_BYTES_PER_FILE = 40_000; // ~40KB
   const MAX_TOTAL_CHARS = 220_000;   // keep prompt reasonable
@@ -1271,6 +1290,10 @@ async function collectWorkspaceContext(wsRoot: vscode.Uri, output: vscode.Output
     try {
       safeRel = normalizeRelativePath(rel);
     } catch {
+      continue;
+    }
+
+    if (path.posix.basename(safeRel).toLowerCase() === "learning_exercises.md") {
       continue;
     }
 
@@ -1316,6 +1339,7 @@ async function collectWorkspaceContext(wsRoot: vscode.Uri, output: vscode.Output
     totalChars += text.length;
   }
 
+  logDuration(output, "Workspace context collection complete", startedAt, `${results.length} file(s), ${totalChars} chars`);
   return results;
 }
 
@@ -1497,6 +1521,80 @@ function getTaskById(context: vscode.ExtensionContext, rel: string, id: string):
   }
   return null;
 }  
+
+async function restoreAllTasksInWorkspace(
+  context: vscode.ExtensionContext,
+  wsRoot: vscode.Uri
+): Promise<{
+  filesUpdated: number;
+  tasksApplied: number;
+  missingFiles: string[];
+  missingMappings: string[];
+}> {
+  const allTasks = context.globalState.get<ScaffoldTask[]>("learningCopilot.lastScaffoldTasks") ?? [];
+  if (allTasks.length === 0) {
+    return { filesUpdated: 0, tasksApplied: 0, missingFiles: [], missingMappings: [] };
+  }
+
+  const tasksByFile = new Map<string, Map<string, ScaffoldTask>>();
+  for (const task of allTasks) {
+    let rel: string;
+    try {
+      rel = normalizeRelativePath(task.path);
+    } catch {
+      continue;
+    }
+    const perFile = tasksByFile.get(rel) ?? new Map<string, ScaffoldTask>();
+    perFile.set(task.id, task);
+    tasksByFile.set(rel, perFile);
+  }
+
+  let filesUpdated = 0;
+  let tasksApplied = 0;
+  const missingFiles: string[] = [];
+  const missingMappings: string[] = [];
+
+  for (const [rel, taskMap] of [...tasksByFile.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    const fileUri = vscode.Uri.joinPath(wsRoot, ...rel.split("/"));
+    let doc: vscode.TextDocument;
+    try {
+      doc = await vscode.workspace.openTextDocument(fileUri);
+    } catch {
+      missingFiles.push(rel);
+      continue;
+    }
+
+    const regions = listTaskRegions(doc.getText());
+    if (regions.length === 0) { continue; }
+
+    const missingInFile = regions
+      .filter((region) => !taskMap.has(region.id))
+      .map((region) => region.id);
+    if (missingInFile.length > 0) {
+      missingMappings.push(`${rel}: ${missingInFile.join(", ")}`);
+      continue;
+    }
+
+    const edit = new vscode.WorkspaceEdit();
+    for (const region of [...regions].reverse()) {
+      const task = taskMap.get(region.id)!;
+      const insert = task.solution.endsWith("\n") ? task.solution : task.solution + "\n";
+      const { range, replacement } = buildReplacementForRegion(doc, region, insert, true);
+      edit.replace(doc.uri, range, replacement);
+    }
+
+    const applied = await vscode.workspace.applyEdit(edit);
+    if (!applied) {
+      throw new Error(`Failed to apply edits for ${rel}.`);
+    }
+
+    await doc.save();
+    filesUpdated++;
+    tasksApplied += regions.length;
+  }
+
+  return { filesUpdated, tasksApplied, missingFiles, missingMappings };
+}
 
 
 //#region <EXTENSION LIFECYCLE AND COMMANDS>
@@ -1775,7 +1873,8 @@ async function generateLearningScaffold(
           configDir,
           logDir,
           output,
-          envOverride
+          envOverride,
+          "Learning task generation"
         );
 
         const stderr = res.stderr.trim();
@@ -1824,7 +1923,8 @@ async function generateLearningScaffold(
             configDir,
             logDir,
             output,
-            envOverride
+            envOverride,
+            "Learning task repair"
           );
 
           const repairStdout = repairRes.stdout.trim();
@@ -1846,12 +1946,12 @@ async function generateLearningScaffold(
           }
 
           setBusyStatus(null);
-          output.appendLine(`[${formatElapsedMs(Date.now() - startedAt)}] Learning task repair succeeded.`);
+          output.appendLine(`[workflow ${formatElapsedMs(Date.now() - startedAt)}] Learning task repair succeeded.`);
           output.appendLine("\n--- Scaffold repair succeeded. ---");
           return repaired;
         }
         setBusyStatus(null);
-        output.appendLine(`[${formatElapsedMs(Date.now() - startedAt)}] Learning task generation complete.`);
+        output.appendLine(`[workflow ${formatElapsedMs(Date.now() - startedAt)}] Learning task generation complete.`);
         return parsed;
       } catch (err) {
         setBusyStatus(null);
@@ -1878,7 +1978,7 @@ async function generateLearningScaffoldFocused(
   return await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: "Learning Copilot: Step 3 of 4 - Generate learning tasks",
+      title: "Learning Copilot: Step 4 of 5 - Generate learning tasks",
       cancellable: false,
     },
     async (progress) => {
@@ -1886,7 +1986,7 @@ async function generateLearningScaffoldFocused(
       let hbTick = 0;
       const startedAt = Date.now();
       try {
-        reportActivity(progress, output, startedAt, "Step 3/4: Preparing focused learning task prompt…", "Step 3/4: Preparing prompt");
+        reportActivity(progress, output, startedAt, "Step 4/5: Preparing focused learning task prompt…", "Step 4/5: Preparing prompt");
 
         // Ensure the user can see logs during long scaffold runs.
         output.show(true);
@@ -1896,7 +1996,7 @@ async function generateLearningScaffoldFocused(
         hb = setInterval(() => {
           hbTick++;
           if (hbTick % 3 === 0) {
-            reportActivity(progress, output, startedAt, "Step 3/4: Still generating focused learning tasks…", "Step 3/4: Generating tasks", 1);
+            reportActivity(progress, output, startedAt, "Step 4/5: Still generating focused learning tasks…", "Step 4/5: Generating tasks", 1);
           } else {
             progress.report({ increment: 1 });
           }
@@ -1959,7 +2059,7 @@ async function generateLearningScaffoldFocused(
           "\n\nContext files (JSON array): " +
           JSON.stringify(contextPayload);
 
-        reportActivity(progress, output, startedAt, "Step 3/4: Asking Copilot to generate focused learning tasks…", "Step 3/4: Waiting for Copilot");
+        reportActivity(progress, output, startedAt, "Step 4/5: Asking Copilot to generate focused learning tasks…", "Step 4/5: Waiting for Copilot");
 
         const res = await runCopilotPrompt(
           copilotPath,
@@ -1969,7 +2069,8 @@ async function generateLearningScaffoldFocused(
           configDir,
           logDir,
           output,
-          envOverride
+          envOverride,
+          "Focused learning task generation"
         );
 
         const stderr = res.stderr.trim();
@@ -1984,9 +2085,9 @@ async function generateLearningScaffoldFocused(
           throw new Error("Copilot scaffold generation returned empty stdout.");
         }
 
-        reportActivity(progress, output, startedAt, "Step 3/4: Parsing focused learning task response…", "Step 3/4: Parsing response");
+        reportActivity(progress, output, startedAt, "Step 4/5: Parsing focused learning task response…", "Step 4/5: Parsing response");
         const parsed = parseScaffoldPlan(stdout);
-        reportActivity(progress, output, startedAt, "Step 3/4: Validating focused learning task output…", "Step 3/4: Validating output");
+        reportActivity(progress, output, startedAt, "Step 4/5: Validating focused learning task output…", "Step 4/5: Validating output");
         const issues = validateScaffoldPlan(parsed);
 
         // Additional focused validation: task regions must start within changedRanges.
@@ -2015,7 +2116,7 @@ async function generateLearningScaffoldFocused(
         }
 
         if (issues.length > 0) {
-          reportActivity(progress, output, startedAt, `Step 3/4: Repairing focused learning tasks (${issues.length} issue${issues.length === 1 ? "" : "s"})…`, "Step 3/4: Repairing output");
+          reportActivity(progress, output, startedAt, `Step 4/5: Repairing focused learning tasks (${issues.length} issue${issues.length === 1 ? "" : "s"})…`, "Step 4/5: Repairing output");
           output.appendLine("\n--- Focused scaffold validation issues detected; attempting one repair pass ---");
           output.appendLine(formatScaffoldIssuesForPrompt(issues));
 
@@ -2032,7 +2133,7 @@ async function generateLearningScaffoldFocused(
             "\n\nContext files (JSON array): " +
             JSON.stringify(contextPayload);
 
-          reportActivity(progress, output, startedAt, "Step 3/4: Asking Copilot for a focused repair pass…", "Step 3/4: Waiting for repair");
+          reportActivity(progress, output, startedAt, "Step 4/5: Asking Copilot for a focused repair pass…", "Step 4/5: Waiting for repair");
           const repairRes = await runCopilotPrompt(
             copilotPath,
             copilotArgs,
@@ -2041,7 +2142,8 @@ async function generateLearningScaffoldFocused(
             configDir,
             logDir,
             output,
-            envOverride
+            envOverride,
+            "Focused learning task repair"
           );
 
           const repairStdout = repairRes.stdout.trim();
@@ -2055,7 +2157,7 @@ async function generateLearningScaffoldFocused(
           }
 
           const repaired = parseScaffoldPlan(repairStdout);
-          reportActivity(progress, output, startedAt, "Step 3/4: Validating repaired focused learning tasks…", "Step 3/4: Validating repair");
+          reportActivity(progress, output, startedAt, "Step 4/5: Validating repaired focused learning tasks…", "Step 4/5: Validating repair");
           const issues2 = validateScaffoldPlan(repaired);
           if (issues2.length > 0) {
             output.appendLine("\n--- Focused scaffold repair still has issues (returning repaired output anyway). ---");
@@ -2065,12 +2167,12 @@ async function generateLearningScaffoldFocused(
           }
 
           setBusyStatus(null);
-          output.appendLine(`[${formatElapsedMs(Date.now() - startedAt)}] Focused learning task repair succeeded.`);
+          output.appendLine(`[workflow ${formatElapsedMs(Date.now() - startedAt)}] Focused learning task repair succeeded.`);
           output.appendLine("\n--- Focused scaffold repair succeeded. ---");
           return repaired;
         }
         setBusyStatus(null);
-        output.appendLine(`[${formatElapsedMs(Date.now() - startedAt)}] Focused learning task generation complete.`);
+        output.appendLine(`[workflow ${formatElapsedMs(Date.now() - startedAt)}] Focused learning task generation complete.`);
         return parsed;
       } finally {
         try { if (hb) { clearInterval(hb); } } catch {}
@@ -2360,7 +2462,9 @@ export async function activate(context: vscode.ExtensionContext) {
         planPrompt,
         configDir,
         logDir,
-        output
+        output,
+        undefined,
+        "Generate code files plan"
       );
 
       const stderr = res.stderr.trim();
@@ -2542,9 +2646,9 @@ export async function activate(context: vscode.ExtensionContext) {
 
       let scaffold: ScaffoldPlan;
       try {
-        scaffold = await generateLearningScaffold(
-          writtenFiles,
-          storageDir,
+          scaffold = await generateLearningScaffold(
+            writtenFiles,
+            storageDir,
           activeCopilotPath,
           copilotArgs,
           configDir,
@@ -2748,19 +2852,6 @@ export async function activate(context: vscode.ExtensionContext) {
         return vscode.window.showInformationMessage("No learning tasks are stored yet.");
       }
 
-      const tasksByFile = new Map<string, Map<string, ScaffoldTask>>();
-      for (const task of allTasks) {
-        let rel: string;
-        try {
-          rel = normalizeRelativePath(task.path);
-        } catch {
-          continue;
-        }
-        const perFile = tasksByFile.get(rel) ?? new Map<string, ScaffoldTask>();
-        perFile.set(task.id, task);
-        tasksByFile.set(rel, perFile);
-      }
-
       let filesUpdated = 0;
       let tasksApplied = 0;
       const missingFiles: string[] = [];
@@ -2773,44 +2864,11 @@ export async function activate(context: vscode.ExtensionContext) {
           cancellable: false,
         },
         async () => {
-          for (const [rel, taskMap] of [...tasksByFile.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-            const fileUri = vscode.Uri.joinPath(wsRoot, ...rel.split("/"));
-            let doc: vscode.TextDocument;
-            try {
-              doc = await vscode.workspace.openTextDocument(fileUri);
-            } catch {
-              missingFiles.push(rel);
-              continue;
-            }
-
-            const regions = listTaskRegions(doc.getText());
-            if (regions.length === 0) { continue; }
-
-            const missingInFile = regions
-              .filter((region) => !taskMap.has(region.id))
-              .map((region) => region.id);
-            if (missingInFile.length > 0) {
-              missingMappings.push(`${rel}: ${missingInFile.join(", ")}`);
-              continue;
-            }
-
-            const edit = new vscode.WorkspaceEdit();
-            for (const region of [...regions].reverse()) {
-              const task = taskMap.get(region.id)!;
-              const insert = task.solution.endsWith("\n") ? task.solution : task.solution + "\n";
-              const { range, replacement } = buildReplacementForRegion(doc, region, insert, true);
-              edit.replace(doc.uri, range, replacement);
-            }
-
-            const applied = await vscode.workspace.applyEdit(edit);
-            if (!applied) {
-              throw new Error(`Failed to apply edits for ${rel}.`);
-            }
-
-            await doc.save();
-            filesUpdated++;
-            tasksApplied += regions.length;
-          }
+          const result = await restoreAllTasksInWorkspace(context, wsRoot);
+          filesUpdated = result.filesUpdated;
+          tasksApplied = result.tasksApplied;
+          missingFiles.push(...result.missingFiles);
+          missingMappings.push(...result.missingMappings);
         }
       );
 
@@ -3021,8 +3079,28 @@ export async function activate(context: vscode.ExtensionContext) {
         async (progress) => {
           const modifyStartedAt = Date.now();
 
+          reportActivity(progress, output, modifyStartedAt, "Step 1/5: Restoring solved workspace from existing tasks…", "Step 1/5: Restoring solved workspace");
+          const restoreResult = await restoreAllTasksInWorkspace(context, wsRoot);
+          if (restoreResult.missingMappings.length > 0) {
+            vscode.window.showErrorMessage(
+              `Could not restore some task regions before modifying the workspace: ${restoreResult.missingMappings.join(" | ")}`
+            );
+            setBusyStatus(null);
+            return;
+          }
+          if (restoreResult.tasksApplied > 0) {
+            output.appendLine(
+              `Restored ${restoreResult.tasksApplied} task solution${restoreResult.tasksApplied === 1 ? "" : "s"} across ${restoreResult.filesUpdated} file${restoreResult.filesUpdated === 1 ? "" : "s"}.`
+            );
+          } else {
+            output.appendLine("No existing task regions were found to restore before modification.");
+          }
+          if (restoreResult.missingFiles.length > 0) {
+            output.appendLine(`Missing file${restoreResult.missingFiles.length === 1 ? "" : "s"} during restore: ${restoreResult.missingFiles.join(", ")}`);
+          }
+
           // Gather workspace context
-          reportActivity(progress, output, modifyStartedAt, "Step 1/4: Collecting workspace context…", "Step 1/4: Collecting context");
+          reportActivity(progress, output, modifyStartedAt, "Step 2/5: Collecting workspace context…", "Step 2/5: Collecting context");
           output.appendLine("\n=== Collecting workspace context ===");
           const ctxFiles = await collectWorkspaceContext(wsRoot, output);
           output.appendLine(`Collected ${ctxFiles.length} file(s) for context.`);
@@ -3069,16 +3147,18 @@ export async function activate(context: vscode.ExtensionContext) {
             "\n\nTask: " +
             userPrompt;
 
-          reportActivity(progress, output, modifyStartedAt, "Step 2/4: Asking Copilot to plan workspace changes…", "Step 2/4: Planning changes");
-          const res = await runCopilotPrompt(
-            activeCopilotPath,
-            copilotArgs,
-            storageDir,
-            planPrompt,
-            configDir,
-            logDir,
-            output
-          );
+          reportActivity(progress, output, modifyStartedAt, "Step 3/5: Asking Copilot to plan workspace changes…", "Step 3/5: Planning changes");
+      const res = await runCopilotPrompt(
+        activeCopilotPath,
+        copilotArgs,
+        storageDir,
+        planPrompt,
+        configDir,
+        logDir,
+        output,
+        undefined,
+        "Modify workspace plan"
+      );
 
           const stderr = res.stderr.trim();
           const stdout = res.stdout.trim();
@@ -3121,7 +3201,7 @@ export async function activate(context: vscode.ExtensionContext) {
             setBusyStatus(null);
             return;
           }
-          reportActivity(progress, output, modifyStartedAt, "Step 2/4: Workspace change plan ready for review.", "Step 2/4: Reviewing plan");
+          reportActivity(progress, output, modifyStartedAt, "Step 3/5: Workspace change plan ready for review.", "Step 3/5: Reviewing plan");
           setBusyStatus(null);
 
           if (plan.notes) {
@@ -3221,7 +3301,7 @@ export async function activate(context: vscode.ExtensionContext) {
             return;
           }
 
-          reportActivity(progress, output, modifyStartedAt, "Step 3/4: Preparing learning tasks for changed files…", "Step 3/4: Preparing tasks");
+          reportActivity(progress, output, modifyStartedAt, "Step 4/5: Preparing learning tasks for changed files…", "Step 4/5: Preparing tasks");
           // Save full solution snapshot of the changed files (private)
           let snapshotDir: string | null = null;
           try {
@@ -3284,11 +3364,11 @@ export async function activate(context: vscode.ExtensionContext) {
             })
             .filter((x): x is { rel: string; content: string } => !!x && changedSet.has(x.rel));
 
-          reportActivity(progress, output, modifyStartedAt, `Step 4/4: Applying learning tasks to ${maskedToApply.length} file(s)…`, "Step 4/4: Applying tasks");
+          reportActivity(progress, output, modifyStartedAt, `Step 5/5: Applying learning tasks to ${maskedToApply.length} file(s)…`, "Step 5/5: Applying tasks");
           await vscode.window.withProgress(
             {
               location: vscode.ProgressLocation.Notification,
-              title: `Learning Copilot: Step 4 of 4 - Apply learning tasks to ${maskedToApply.length} file(s)`,
+              title: `Learning Copilot: Step 5 of 5 - Apply learning tasks to ${maskedToApply.length} file(s)`,
               cancellable: false,
             },
             async () => {
