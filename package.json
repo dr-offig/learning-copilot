@@ -4,6 +4,10 @@
   "displayName": "learning-copilot",
   "description": "AI code generator that scaffolds with learning experiences",
   "version": "0.0.1",
+  "repository" : {
+    "type": "git",
+    "url": "https://github.com/tgifford-usc/learning-copilot.git"
+  },
   "engines": {
     "vscode": "^1.109.0"
   },

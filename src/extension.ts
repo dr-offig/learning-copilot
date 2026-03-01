@@ -2,7 +2,6 @@ import * as vscode from "vscode";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
-import * as https from "node:https";
 import * as path from "node:path";
 
 let lastOutput: string | null = null;
@@ -90,6 +89,45 @@ function getConfiguredCopilotPath(): string {
 }
 
 /**
+ * Checks whether the given copilot executable is runnable by invoking
+ * `--version`. Returns true if the process exits with code 0 within timeout.
+ */
+function isCopilotAvailable(copilotPath: string): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    try {
+      const p = spawn(copilotPath, ["--version"]);
+      let done = false;
+      p.on("error", () => {
+        if (!done) {
+          done = true;
+          resolve(false);
+        }
+      });
+      p.on("exit", (code) => {
+        if (!done) {
+          done = true;
+          resolve(code === 0);
+        }
+      });
+      // safety timeout
+      setTimeout(() => {
+        if (!done) {
+          done = true;
+          try {
+            p.kill();
+          } catch (e) {
+            // ignore
+          }
+          resolve(false);
+        }
+      }, 3000);
+    } catch (e) {
+      resolve(false);
+    }
+  });
+}
+
+/**
  * Builds the extension-local Copilot config directory path.
  *
  * @param storageDir Extension storage directory.
@@ -130,67 +168,6 @@ async function startCopilotLoginInTerminal(storageDir: string): Promise<void> {
   setTimeout(() => {
     terminal.sendText("/login");
   }, 700);
-}
-
-type GithubRelease = {
-  assets: Array<{ name: string; browser_download_url: string }>;
-};
-
-/**
- * Fetches JSON from HTTPS and parses it into the requested type.
- *
- * @param url URL that returns JSON.
- */
-function httpsJson<T>(url: string): Promise<T> {
-  return new Promise((resolve, reject) => {
-    https
-    .get(url, { headers: { "User-Agent": "learning-copilot" } }, (res) => {
-      let data = "";
-      res.on("data", (d) => (data += d.toString("utf8")));
-      res.on("end", () => {
-        try {
-          if (res.statusCode !== 200) {
-            reject(new Error(`HTTP ${res.statusCode}: ${data.slice(0, 200)}`));
-            return;
-          }
-          resolve(JSON.parse(data) as T);
-        } catch (e) {
-          reject(e);
-        }
-      });
-    })
-    .on("error", reject);
-  });
-}
-
-/**
- * Downloads a URL to a local file, following HTTP redirects.
- *
- * @param url Source URL.
- * @param filePath Destination file path.
- */
-function downloadToFile(url: string, filePath: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const request = https.get(url, { headers: { "User-Agent": "learning-copilot" } }, (res) => {
-      // Handle redirects
-      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        res.resume();
-        downloadToFile(res.headers.location, filePath).then(resolve, reject);
-        return;
-      }
-      if (res.statusCode !== 200) {
-        const code = res.statusCode ?? "unknown";
-        res.resume();
-        reject(new Error(`Download failed (${code}) for ${url}`));
-        return;
-      }
-      const file = fs.createWriteStream(filePath);
-      res.pipe(file);
-      file.on("finish", () => file.close(() => resolve()));
-      file.on("error", (err) => reject(err));
-    });
-    request.on("error", reject);
-  });
 }
 
 /**
@@ -250,29 +227,34 @@ async function installCopilotCliMacLinux(storageDir: string, output: vscode.Outp
 async function installCopilotCliWindows(storageDir: string, output: vscode.OutputChannel): Promise<string> {
   const installRoot = path.join(storageDir, "copilot-cli");
   await fsp.mkdir(installRoot, { recursive: true });
-  
-  // Find latest release
-  const rel = await httpsJson<GithubRelease>("https://api.github.com/repos/github/gh-copilot/releases/latest");
-  const asset = rel.assets.find((a) => /windows/i.test(a.name) && /\.zip$/i.test(a.name));
-  if (!asset) {
-    throw new Error("Could not find a Windows .zip release asset for Copilot CLI.");
-  }
-  
-  const zipPath = path.join(installRoot, asset.name);
-  output.appendLine(`Downloading: ${asset.name}`);
-  await downloadToFile(asset.browser_download_url, zipPath);
-  
   const extractDir = path.join(installRoot, "extracted");
+  await fsp.rm(extractDir, { recursive: true, force: true });
   await fsp.mkdir(extractDir, { recursive: true });
-  
-  // Use built-in PowerShell to expand the archive (works on locked-down Windows).
+
+  // On locked-down lab machines, PowerShell networking tends to work more
+  // reliably than Node's HTTPS stack for GitHub release downloads.
   const esc = (s: string) => s.replace(/'/g, "''");
-  const ps = `Expand-Archive -LiteralPath '${esc(zipPath)}' -DestinationPath '${esc(extractDir)}' -Force`;
-  output.appendLine(`> powershell -NoProfile -ExecutionPolicy Bypass -Command ${JSON.stringify(ps)}`);
+  const scriptPath = path.join(installRoot, "install-copilot.ps1");
+  const ps = `
+$ErrorActionPreference = "Stop"
+$Base = '${esc(installRoot)}'
+$ExtractDir = '${esc(extractDir)}'
+$rel = Invoke-RestMethod "https://api.github.com/repos/github/gh-copilot/releases/latest"
+$asset = $rel.assets | Where-Object { $_.name -match "windows" -and $_.name -match "\\.zip$" } | Select-Object -First 1
+if (-not $asset) {
+  $rel.assets | Select-Object name, browser_download_url | Out-String | Write-Host
+  throw "Couldn't find a Windows .zip asset in the latest release."
+}
+$zipPath = Join-Path $Base $asset.name
+Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
+Expand-Archive -LiteralPath $zipPath -DestinationPath $ExtractDir -Force
+`;
+  await fsp.writeFile(scriptPath, ps, "utf8");
+  output.appendLine(`> powershell -NoProfile -ExecutionPolicy Bypass -File ${JSON.stringify(scriptPath)}`);
   
   await runCommandStreaming(
     "powershell",
-    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
     installRoot,
     output
   );
@@ -1905,6 +1887,27 @@ export async function activate(context: vscode.ExtensionContext) {
         output.show(true);
         try {
           const storageDir = await ensureStorageDir(context);
+
+          // Check if a copilot binary is already available. Prefer the configured
+          // path, but also check a plain 'copilot' on PATH as a fallback.
+          const configured = getConfiguredCopilotPath();
+          let alreadyInstalled = await isCopilotAvailable(configured);
+          if (!alreadyInstalled && configured !== "copilot") {
+            alreadyInstalled = await isCopilotAvailable("copilot");
+          }
+
+          if (alreadyInstalled) {
+            const pick = await vscode.window.showInformationMessage(
+              `Copilot CLI appears to be installed and runnable. Reinstall?`,
+              { modal: true },
+              "Reinstall"
+            );
+            if (!pick || pick !== "Reinstall") {
+              vscode.window.showInformationMessage("Copilot CLI installation skipped.");
+              return;
+            }
+          }
+
           const installedPath = await vscode.window.withProgress(
             {
               location: vscode.ProgressLocation.Notification,
