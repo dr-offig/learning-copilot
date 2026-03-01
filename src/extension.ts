@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 
 let lastOutput: string | null = null;
@@ -80,12 +81,59 @@ async function setCopilotPath(newPath: string): Promise<void> {
   await cfg.update("copilotPath", newPath, vscode.ConfigurationTarget.Global);
 }
 
+async function pickAndSetCopilotPath(): Promise<string | null> {
+  const pick = await vscode.window.showOpenDialog({
+    canSelectFiles: true,
+    canSelectFolders: false,
+    canSelectMany: false,
+    openLabel: "Use Copilot CLI",
+    filters: process.platform === "win32"
+      ? { "Executables": ["exe", "cmd"] }
+      : undefined,
+  });
+  const chosen = pick?.[0];
+  if (!chosen) {
+    return null;
+  }
+
+  const selectedPath = chosen.fsPath;
+  const kind = await detectCopilotCliKind(selectedPath);
+  if (kind === "missing") {
+    throw new Error(`Selected file is not a runnable Copilot CLI: ${selectedPath}`);
+  }
+  if (kind === "legacy") {
+    throw new Error(`Selected file is the deprecated gh-copilot CLI: ${selectedPath}`);
+  }
+
+  await setCopilotPath(selectedPath);
+  return selectedPath;
+}
+
 /**
  * Resolves the currently configured Copilot CLI executable path.
  */
 function getConfiguredCopilotPath(): string {
   const { copilotPath } = getConfig();
   return copilotPath;
+}
+
+function getDefaultCopilotConfigDir(): string {
+  return path.join(os.homedir(), ".copilot");
+}
+
+async function getInstalledCopilotStatus(): Promise<{ path: string; kind: CopilotCliKind }> {
+  const configured = getConfiguredCopilotPath();
+  const configuredKind = await detectCopilotCliKind(configured);
+  if (configuredKind !== "missing" || configured === "copilot") {
+    return { path: configured, kind: configuredKind };
+  }
+
+  const fallbackKind = await detectCopilotCliKind("copilot");
+  if (fallbackKind !== "missing") {
+    return { path: "copilot", kind: fallbackKind };
+  }
+
+  return { path: configured, kind: "missing" };
 }
 
 /**
@@ -127,6 +175,112 @@ function isCopilotAvailable(copilotPath: string): Promise<boolean> {
   });
 }
 
+type CopilotCliKind = "missing" | "legacy" | "modern";
+type CopilotAuthStatus = "authenticated" | "unauthenticated" | "unknown";
+
+/**
+ * Distinguishes the current prompt-capable Copilot CLI from the deprecated
+ * legacy gh-copilot binary.
+ */
+function detectCopilotCliKind(copilotPath: string): Promise<CopilotCliKind> {
+  return new Promise<CopilotCliKind>((resolve) => {
+    try {
+      const p = spawn(copilotPath, ["-p", "__learning_copilot_probe__"], { shell: false });
+      let done = false;
+      let combined = "";
+      const legacyPattern = /unknown shorthand flag:\s*'p'|unknown command .* for "copilot"/i;
+
+      const finish = (kind: CopilotCliKind) => {
+        if (!done) {
+          done = true;
+          try {
+            p.kill();
+          } catch {
+            // ignore
+          }
+          resolve(kind);
+        }
+      };
+
+      const inspect = (chunk: Buffer | string) => {
+        combined += chunk.toString();
+        if (legacyPattern.test(combined)) {
+          finish("legacy");
+        }
+      };
+
+      p.stdout.on("data", inspect);
+      p.stderr.on("data", inspect);
+      p.on("error", () => finish("missing"));
+      p.on("exit", () => finish(legacyPattern.test(combined) ? "legacy" : "modern"));
+
+      // The modern CLI may take longer because it starts actual prompt handling.
+      setTimeout(() => finish(legacyPattern.test(combined) ? "legacy" : "modern"), 1500);
+    } catch {
+      resolve("missing");
+    }
+  });
+}
+
+/**
+ * Best-effort authentication probe. This intentionally errs on "unknown"
+ * instead of prompting the user or blocking for a long-running model response.
+ */
+function detectCopilotAuthStatus(copilotPath: string): Promise<CopilotAuthStatus> {
+  return new Promise<CopilotAuthStatus>((resolve) => {
+    try {
+      const p = spawn(
+        copilotPath,
+        ["-s", "-p", "Reply with OK only.", "--allow-all-tools"],
+        { shell: false }
+      );
+      let done = false;
+      let stdout = "";
+      let stderr = "";
+      const unauthPattern =
+        /no authentication information found|not logged in|authentication required|run .*login/i;
+
+      const finish = (status: CopilotAuthStatus) => {
+        if (!done) {
+          done = true;
+          try {
+            p.kill();
+          } catch {
+            // ignore
+          }
+          resolve(status);
+        }
+      };
+
+      p.stdout.on("data", (d) => {
+        stdout += d.toString("utf8");
+      });
+      p.stderr.on("data", (d) => {
+        stderr += d.toString("utf8");
+        if (unauthPattern.test(stderr)) {
+          finish("unauthenticated");
+        }
+      });
+      p.on("error", () => finish("unknown"));
+      p.on("exit", (code) => {
+        if (unauthPattern.test(stderr)) {
+          finish("unauthenticated");
+          return;
+        }
+        if (code === 0 && stdout.trim()) {
+          finish("authenticated");
+          return;
+        }
+        finish("unknown");
+      });
+
+      setTimeout(() => finish("unknown"), 5000);
+    } catch {
+      resolve("unknown");
+    }
+  });
+}
+
 /**
  * Builds the extension-local Copilot config directory path.
  *
@@ -146,28 +300,35 @@ function getCopilotLogDir(storageDir: string): string {
 }
 
 /**
- * Opens a terminal and starts Copilot CLI, then triggers `/login`.
- *
- * @param storageDir Extension storage directory.
+ * Opens a terminal and starts the Copilot CLI login flow.
  */
-async function startCopilotLoginInTerminal(storageDir: string): Promise<void> {
-  const copilotPath = getConfiguredCopilotPath();
-  const configDir = getCopilotConfigDir(storageDir);
-  const logDir = getCopilotLogDir(storageDir);
-  await fsp.mkdir(configDir, { recursive: true });
-  await fsp.mkdir(logDir, { recursive: true });
+async function startCopilotLoginInTerminal(copilotPath: string): Promise<void> {
+  const wsRoot = getWorkspaceRootUri();
 
   const terminal = vscode.window.createTerminal({
-    name: "Learning Copilot: Copilot CLI",
+    name: "Learning Copilot: Copilot CLI Login",
+    cwd: wsRoot?.fsPath,
   });
   terminal.show(true);
 
   const quoted = copilotPath.includes(" ") ? `\"${copilotPath}\"` : copilotPath;
-  const cmd = `${quoted} --config-dir "${configDir}" --log-dir "${logDir}" --log-level debug`;
-  terminal.sendText(cmd);
-  setTimeout(() => {
-    terminal.sendText("/login");
-  }, 700);
+  terminal.sendText(`${quoted} login`);
+}
+
+/**
+ * Opens a terminal and starts the Copilot CLI logout flow using the
+ * interactive slash-command form supported by the Windows binary.
+ */
+async function startCopilotLogoutInTerminal(copilotPath: string): Promise<void> {
+  const wsRoot = getWorkspaceRootUri();
+  const terminal = vscode.window.createTerminal({
+    name: "Learning Copilot: Copilot CLI Logout",
+    cwd: wsRoot?.fsPath,
+  });
+  terminal.show(true);
+
+  const quoted = copilotPath.includes(" ") ? `\"${copilotPath}\"` : copilotPath;
+  terminal.sendText(`${quoted} -i "/logout"`);
 }
 
 /**
@@ -228,54 +389,60 @@ async function installCopilotCliWindows(storageDir: string, output: vscode.Outpu
   const installRoot = path.join(storageDir, "copilot-cli");
   await fsp.mkdir(installRoot, { recursive: true });
   const extractDir = path.join(installRoot, "extracted");
+  const installedExe = path.join(installRoot, "copilot.exe");
   await fsp.rm(extractDir, { recursive: true, force: true });
+  await fsp.rm(installedExe, { force: true });
   await fsp.mkdir(extractDir, { recursive: true });
 
-  // On locked-down lab machines, PowerShell networking tends to work more
-  // reliably than Node's HTTPS stack for GitHub release downloads.
+  const assetArch =
+    process.arch === "x64" ? "x64" :
+    process.arch === "arm64" ? "arm64" :
+    null;
+  if (!assetArch) {
+    throw new Error(`Unsupported Windows architecture for Copilot CLI: ${process.arch}`);
+  }
+
+  // Use GitHub release assets directly so Windows lab machines do not need Node/npm.
   const esc = (s: string) => s.replace(/'/g, "''");
   const scriptPath = path.join(installRoot, "install-copilot.ps1");
   const ps = `
 $ErrorActionPreference = "Stop"
 $Base = '${esc(installRoot)}'
 $ExtractDir = '${esc(extractDir)}'
-$rel = Invoke-RestMethod "https://api.github.com/repos/github/gh-copilot/releases/latest"
-$asset = $rel.assets | Where-Object { $_.name -match "windows" -and $_.name -match "\\.zip$" } | Select-Object -First 1
+$InstalledExe = '${esc(installedExe)}'
+$AssetName = 'copilot-win32-${assetArch}.zip'
+$rel = Invoke-RestMethod "https://api.github.com/repos/github/copilot-cli/releases/latest"
+$asset = $rel.assets | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
+if (-not $asset) {
+  $asset = $rel.assets | Where-Object { $_.name -match '^copilot-win32-.*\\.zip$' } | Select-Object -First 1
+}
 if (-not $asset) {
   $rel.assets | Select-Object name, browser_download_url | Out-String | Write-Host
-  throw "Couldn't find a Windows .zip asset in the latest release."
+  throw "Couldn't find a Windows Copilot CLI .zip asset in the latest release."
 }
 $zipPath = Join-Path $Base $asset.name
 Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
 Expand-Archive -LiteralPath $zipPath -DestinationPath $ExtractDir -Force
+$exe = Get-ChildItem -Path $ExtractDir -Recurse -Filter 'copilot.exe' | Select-Object -First 1
+if (-not $exe) {
+  throw "Install finished but copilot.exe was not found in the extracted archive."
+}
+Copy-Item -LiteralPath $exe.FullName -Destination $InstalledExe -Force
 `;
   await fsp.writeFile(scriptPath, ps, "utf8");
   output.appendLine(`> powershell -NoProfile -ExecutionPolicy Bypass -File ${JSON.stringify(scriptPath)}`);
-  
+
   await runCommandStreaming(
     "powershell",
     ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
     installRoot,
     output
   );
-  
-  // Find copilot.exe
-  const stack: string[] = [extractDir];
-  while (stack.length) {
-    const dir = stack.pop()!;
-    const entries = await fsp.readdir(dir, { withFileTypes: true });
-    for (const e of entries) {
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) {
-        stack.push(full);
-      }
-      if (e.isFile() && e.name.toLowerCase() === "copilot.exe") {
-        return full;
-      }
-    }
+
+  if (!fs.existsSync(installedExe)) {
+    throw new Error(`Install finished but Copilot binary not found at: ${installedExe}`);
   }
-  
-  throw new Error("Install finished but copilot.exe was not found in the extracted folder.");
+  return installedExe;
 }
 
 //#endregion
@@ -299,21 +466,55 @@ async function ensureStorageDir(context: vscode.ExtensionContext): Promise<strin
   return context.globalStorageUri.fsPath;
 }
 
-// Helper to get a GitHub access token from VS Code's built-in authentication.
-/**
- * Requests a GitHub token from VS Code authentication.
- */
-async function getVsCodeGitHubToken(): Promise<string | null> {
-  try {
-    // This will prompt the user to sign in to GitHub in VS Code if needed.
-    const session = await vscode.authentication.getSession(
-      "github",
-      ["read:user"],
-      { createIfNone: true }
-    );
-    return session?.accessToken ?? null;
-  } catch {
-    return null;
+async function showCopilotCliDetails(context: vscode.ExtensionContext): Promise<void> {
+  const storageDir = await ensureStorageDir(context);
+  const configuredPath = getConfiguredCopilotPath();
+  const status = await getInstalledCopilotStatus();
+  const authStatus = status.kind === "modern"
+    ? await detectCopilotAuthStatus(status.path)
+    : "unknown";
+
+  const lines = [
+    `Configured path: ${configuredPath}`,
+    `Active path: ${status.path}`,
+    `CLI type: ${status.kind}`,
+    `Auth status: ${authStatus}`,
+    `Extension storage: ${storageDir}`,
+    `Default Copilot config dir: ${getDefaultCopilotConfigDir()}`,
+  ];
+
+  const pick = await vscode.window.showInformationMessage(
+    lines.join("\n"),
+    { modal: true },
+    "Copy Path",
+    "Reveal Binary",
+    "Set Path"
+  );
+
+  if (pick === "Copy Path") {
+    await vscode.env.clipboard.writeText(status.path);
+    vscode.window.showInformationMessage("Copied Copilot CLI path to clipboard.");
+    return;
+  }
+
+  if (pick === "Reveal Binary") {
+    if (!path.isAbsolute(status.path) || !fs.existsSync(status.path)) {
+      vscode.window.showWarningMessage("The active Copilot CLI path is not a local file that can be revealed.");
+      return;
+    }
+    await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(status.path));
+    return;
+  }
+
+  if (pick === "Set Path") {
+    try {
+      const newPath = await pickAndSetCopilotPath();
+      if (newPath) {
+        vscode.window.showInformationMessage(`Copilot CLI path set to: ${newPath}`);
+      }
+    } catch (err: any) {
+      vscode.window.showErrorMessage(err?.message ?? String(err));
+    }
   }
 }
 
@@ -507,31 +708,11 @@ function runCopilotPrompt(
   output: vscode.OutputChannel,
   envOverride?: NodeJS.ProcessEnv
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
+  void configDir;
+  void logDir;
   return new Promise((resolve, reject) => {
-    // Copilot CLI's programmatic mode can emit TUI/extra metadata unless `-s` is used.
-    // In an extension host (non-TTY), that can result in *no captured output*.
-    // So we force `-s` ("silent": output only Copilot's response) unless the caller already set it.
-    const hasSilent = args.includes("-s") || args.includes("--silent");
-    const effectiveArgs = hasSilent ? args : [...args, "-s"];
-
-    // If caller already provided --log-level/--log-dir/--disable-mcp-server/--config-dir, don't duplicate.
-    const hasAny = (flag: string) => effectiveArgs.includes(flag);
-    const withLogging = [...effectiveArgs];
-
-    if (!hasAny("--log-level")) {
-      withLogging.unshift("--log-level", "debug");
-    }
-    if (!hasAny("--log-dir")) {
-      withLogging.unshift("--log-dir", logDir);
-    }
-    if (!hasAny("--disable-mcp-server")) {
-      withLogging.unshift("--disable-mcp-server", "github-mcp-server");
-    }
-    if (!hasAny("--config-dir")) {
-      withLogging.unshift("--config-dir", configDir);
-    }
-
-    const proc = spawn(copilotPath, [...withLogging, "-p", prompt], {
+    const effectiveArgs = [...args, "-p", prompt];
+    const proc = spawn(copilotPath, effectiveArgs, {
       cwd,
       env: { ...process.env, ...(envOverride ?? {}) },
       shell: false,
@@ -565,7 +746,7 @@ function runCopilotPrompt(
       resolve({ stdout, stderr, exitCode });
     });
     
-    output.appendLine(`> ${copilotPath} ${[...withLogging, "-p", JSON.stringify(prompt)].join(" ")}`);
+    output.appendLine(`> ${copilotPath} ${[...args, "-p", JSON.stringify(prompt)].join(" ")}`);
   });
 }
 
@@ -1418,7 +1599,7 @@ async function generateLearningScaffold(
   configDir: string,
   logDir: string,
   output: vscode.OutputChannel,
-  envOverride: NodeJS.ProcessEnv
+  envOverride?: NodeJS.ProcessEnv
 ): Promise<ScaffoldPlan> {
   
   return await vscode.window.withProgress(
@@ -1606,7 +1787,7 @@ async function generateLearningScaffoldFocused(
   configDir: string,
   logDir: string,
   output: vscode.OutputChannel,
-  envOverride: NodeJS.ProcessEnv
+  envOverride?: NodeJS.ProcessEnv
 ): Promise<ScaffoldPlan> {
   return await vscode.window.withProgress(
     {
@@ -1888,15 +2069,8 @@ export async function activate(context: vscode.ExtensionContext) {
         try {
           const storageDir = await ensureStorageDir(context);
 
-          // Check if a copilot binary is already available. Prefer the configured
-          // path, but also check a plain 'copilot' on PATH as a fallback.
-          const configured = getConfiguredCopilotPath();
-          let alreadyInstalled = await isCopilotAvailable(configured);
-          if (!alreadyInstalled && configured !== "copilot") {
-            alreadyInstalled = await isCopilotAvailable("copilot");
-          }
-
-          if (alreadyInstalled) {
+          const existing = await getInstalledCopilotStatus();
+          if (existing.kind === "modern") {
             const pick = await vscode.window.showInformationMessage(
               `Copilot CLI appears to be installed and runnable. Reinstall?`,
               { modal: true },
@@ -1906,6 +2080,11 @@ export async function activate(context: vscode.ExtensionContext) {
               vscode.window.showInformationMessage("Copilot CLI installation skipped.");
               return;
             }
+          }
+          if (existing.kind === "legacy") {
+            output.appendLine(
+              `Configured Copilot CLI at ${existing.path} is the deprecated gh-copilot binary and will be replaced.`
+            );
           }
 
           const installedPath = await vscode.window.withProgress(
@@ -1926,9 +2105,29 @@ export async function activate(context: vscode.ExtensionContext) {
           );
           
           await setCopilotPath(installedPath);
-          vscode.window.showInformationMessage(
-            `Copilot CLI installed at: ${installedPath}`
-          );
+          const authStatus = await detectCopilotAuthStatus(installedPath);
+          if (authStatus === "unauthenticated") {
+            const pick = await vscode.window.showInformationMessage(
+              `Copilot CLI installed at: ${installedPath}`,
+              "Login Now",
+              "Details",
+              "Later"
+            );
+            if (pick === "Login Now") {
+              await vscode.commands.executeCommand("learningCopilot.loginCopilotCli");
+            } else if (pick === "Details") {
+              await vscode.commands.executeCommand("learningCopilot.showCopilotCliDetails");
+            }
+          } else {
+            const suffix = authStatus === "authenticated" ? " Already logged in." : "";
+            const pick = await vscode.window.showInformationMessage(
+              `Copilot CLI installed at: ${installedPath}${suffix}`,
+              "Details"
+            );
+            if (pick === "Details") {
+              await vscode.commands.executeCommand("learningCopilot.showCopilotCliDetails");
+            }
+          }
         } catch (err: any) {
           vscode.window.showErrorMessage(
             `Failed to install Copilot CLI: ${err?.message ?? String(err)}`
@@ -1942,11 +2141,76 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand("learningCopilot.loginCopilotCli", async () => {
       try {
-        const storageDir = await ensureStorageDir(context);
-        await startCopilotLoginInTerminal(storageDir);
+        const status = await getInstalledCopilotStatus();
+        if (status.kind === "legacy") {
+          vscode.window.showErrorMessage(
+            "Learning Copilot is configured to use the deprecated gh-copilot binary. Run 'Learning Copilot: Install/Setup Copilot CLI' again first."
+          );
+          return;
+        }
+        if (status.kind === "missing") {
+          vscode.window.showErrorMessage(
+            "Copilot CLI is not installed or not found. Run 'Learning Copilot: Install/Setup Copilot CLI' first."
+          );
+          return;
+        }
+        await startCopilotLoginInTerminal(status.path);
       } catch (err: any) {
         vscode.window.showErrorMessage(
           `Failed to start Copilot CLI login: ${err?.message ?? String(err)}`
+        );
+      }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("learningCopilot.logoutCopilotCli", async () => {
+      try {
+        const status = await getInstalledCopilotStatus();
+        if (status.kind !== "modern") {
+          vscode.window.showErrorMessage(
+            "A modern Copilot CLI binary is not configured. Install or set the Copilot CLI first."
+          );
+          return;
+        }
+        await startCopilotLogoutInTerminal(status.path);
+      } catch (err: any) {
+        vscode.window.showErrorMessage(
+          `Failed to start Copilot CLI logout: ${err?.message ?? String(err)}`
+        );
+      }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("learningCopilot.showCopilotCliDetails", async () => {
+      try {
+        await showCopilotCliDetails(context);
+      } catch (err: any) {
+        vscode.window.showErrorMessage(
+          `Failed to show Copilot CLI details: ${err?.message ?? String(err)}`
+        );
+      }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("learningCopilot.setCopilotCliPath", async () => {
+      try {
+        const newPath = await pickAndSetCopilotPath();
+        if (!newPath) {
+          return;
+        }
+        const authStatus = await detectCopilotAuthStatus(newPath);
+        const suffix = authStatus === "authenticated"
+          ? " Already logged in."
+          : authStatus === "unauthenticated"
+            ? " Login is still required."
+            : "";
+        vscode.window.showInformationMessage(`Copilot CLI path set to: ${newPath}${suffix}`);
+      } catch (err: any) {
+        vscode.window.showErrorMessage(
+          `Failed to set Copilot CLI path: ${err?.message ?? String(err)}`
         );
       }
     })
@@ -1962,7 +2226,7 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      const { copilotPath, copilotArgs } = getConfig();
+      const { copilotArgs } = getConfig();
       const storageDir = await ensureStorageDir(context);
       const logDir = getCopilotLogDir(storageDir);
       const configDir = getCopilotConfigDir(storageDir);
@@ -1975,6 +2239,21 @@ export async function activate(context: vscode.ExtensionContext) {
       });
       if (!userPrompt) { return; }
 
+      const status = await getInstalledCopilotStatus();
+      if (status.kind === "legacy") {
+        vscode.window.showErrorMessage(
+          "Learning Copilot is configured to use the deprecated gh-copilot binary. Run 'Learning Copilot: Install/Setup Copilot CLI' again, then 'Login to Copilot CLI'."
+        );
+        return;
+      }
+      if (status.kind === "missing") {
+        vscode.window.showErrorMessage(
+          "Copilot CLI is not installed or not found. Run 'Learning Copilot: Install/Setup Copilot CLI' first."
+        );
+        return;
+      }
+      const activeCopilotPath = status.path;
+
       const planPrompt =
         "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
         'Schema: {"files":[{"path":string,"content":string,"overwrite":boolean?}],"notes":string?}. ' +
@@ -1984,20 +2263,14 @@ export async function activate(context: vscode.ExtensionContext) {
 
       output.show(true);
 
-      const token = await getVsCodeGitHubToken();
-      const envOverride: NodeJS.ProcessEnv = token
-        ? { COPILOT_GITHUB_TOKEN: token, GH_TOKEN: token, GITHUB_TOKEN: token }
-        : {};
-
       const res = await runCopilotPrompt(
-        copilotPath,
+        activeCopilotPath,
         copilotArgs,
         storageDir,
         planPrompt,
         configDir,
         logDir,
-        output,
-        envOverride
+        output
       );
 
       const stderr = res.stderr.trim();
@@ -2008,7 +2281,7 @@ export async function activate(context: vscode.ExtensionContext) {
       if (res.exitCode !== 0) {
         if (stderr.toLowerCase().includes("no authentication information found")) {
           const choice = await vscode.window.showErrorMessage(
-            "Copilot CLI is installed but not logged in. Open a terminal to run /login now?",
+            "Copilot CLI is installed but not logged in. Open a terminal to run 'copilot login' now?",
             "Login",
             "Cancel"
           );
@@ -2182,12 +2455,11 @@ export async function activate(context: vscode.ExtensionContext) {
         scaffold = await generateLearningScaffold(
           writtenFiles,
           storageDir,
-          copilotPath,
+          activeCopilotPath,
           copilotArgs,
           configDir,
           logDir,
-          output,
-          envOverride
+          output
         );
       } catch (e: any) {
         vscode.window.showErrorMessage(`Failed to generate learning scaffold: ${e?.message ?? String(e)}`);
@@ -2538,7 +2810,7 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      const { copilotPath, copilotArgs } = getConfig();
+      const { copilotArgs } = getConfig();
       const storageDir = await ensureStorageDir(context);
       const logDir = getCopilotLogDir(storageDir);
       const configDir = getCopilotConfigDir(storageDir);
@@ -2569,10 +2841,20 @@ export async function activate(context: vscode.ExtensionContext) {
         }
       }
 
-      const token = await getVsCodeGitHubToken();
-      const envOverride: NodeJS.ProcessEnv = token
-        ? { COPILOT_GITHUB_TOKEN: token, GH_TOKEN: token, GITHUB_TOKEN: token }
-        : {};
+      const status = await getInstalledCopilotStatus();
+      if (status.kind === "legacy") {
+        vscode.window.showErrorMessage(
+          "Learning Copilot is configured to use the deprecated gh-copilot binary. Run 'Learning Copilot: Install/Setup Copilot CLI' again, then 'Login to Copilot CLI'."
+        );
+        return;
+      }
+      if (status.kind === "missing") {
+        vscode.window.showErrorMessage(
+          "Copilot CLI is not installed or not found. Run 'Learning Copilot: Install/Setup Copilot CLI' first."
+        );
+        return;
+      }
+      const activeCopilotPath = status.path;
 
       const planPrompt =
         "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
@@ -2589,14 +2871,13 @@ export async function activate(context: vscode.ExtensionContext) {
         userPrompt;
 
       const res = await runCopilotPrompt(
-        copilotPath,
+        activeCopilotPath,
         copilotArgs,
         storageDir,
         planPrompt,
         configDir,
         logDir,
-        output,
-        envOverride
+        output
       );
 
       const stderr = res.stderr.trim();
@@ -2605,7 +2886,7 @@ export async function activate(context: vscode.ExtensionContext) {
       if (res.exitCode !== 0) {
         if (stderr.toLowerCase().includes("no authentication information found")) {
           const choice = await vscode.window.showErrorMessage(
-            "Copilot CLI is installed but not logged in. Open a terminal to run /login now?",
+            "Copilot CLI is installed but not logged in. Open a terminal to run 'copilot login' now?",
             "Login",
             "Cancel"
           );
@@ -2762,12 +3043,11 @@ export async function activate(context: vscode.ExtensionContext) {
        focusWithDiff,
        scaffoldContext,
        storageDir,
-       copilotPath,
+       activeCopilotPath,
        copilotArgs,
        configDir,
        logDir,
-       output,
-       envOverride
+       output
      );
    } catch (e: any) {
      vscode.window.showErrorMessage(`Failed to generate learning scaffold: ${e?.message ?? String(e)}`);

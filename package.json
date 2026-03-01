@@ -20,6 +20,10 @@
     "commands": [
       { "command": "learningCopilot.saveLastOutput", "title": "Learning Copilot: Save Last Output" },
       { "command": "learningCopilot.installCopilotCli", "title": "Learning Copilot: Install/Setup Copilot CLI" },
+      { "command": "learningCopilot.loginCopilotCli", "title": "Learning Copilot: Login to Copilot CLI" },
+      { "command": "learningCopilot.logoutCopilotCli", "title": "Learning Copilot: Logout of Copilot CLI" },
+      { "command": "learningCopilot.showCopilotCliDetails", "title": "Learning Copilot: Show Copilot CLI Details" },
+      { "command": "learningCopilot.setCopilotCliPath", "title": "Learning Copilot: Set Copilot CLI Path" },
       { "command": "learningCopilot.generateCodeFilesPrompt", "title": "Learning Copilot: Generate Code Files from Prompt" },
       { "command": "learningCopilot.compareWithSolution", "title": "Learning Copilot: Compare Active File With Solution"},
       { "command": "learningCopilot.applyBlankAtCursor", "title": "Learning Copilot: Apply Solution For Blank At Cursor" },
