@@ -8,6 +8,7 @@ import * as path from "node:path";
 let lastOutput: string | null = null;
 
 let statusBar: vscode.StatusBarItem | null = null;
+let lastTaskLinkColumn: vscode.ViewColumn | undefined;
 
 function setBusyStatus(text: string | null) {
   if (!statusBar) { return; }
@@ -57,6 +58,7 @@ function logDuration(
 const proposedContent = new Map<string, string>();
 const PROPOSED_SCHEME = "learning-copilot";
 const SOLUTION_SCHEME = "learning-copilot-solution";
+const EXTENSION_URI_ID = "tgifford-usc.learning-copilot";
 
 type WrittenFile = { rel: string; fullContent: string };
 
@@ -1263,6 +1265,18 @@ function looksLikeText(buf: Uint8Array): boolean {
 
 type WorkspaceFileContext = { path: string; content: string; truncated?: boolean };
 
+type TaskJumpLink = {
+  id: string;
+  rel: string;
+  line: number;
+  uri: string;
+};
+
+type TaskJumpTarget = {
+  path: string;
+  line: number;
+};
+
 /**
  * Collects a limited snapshot of workspace files to provide Copilot with context.
  * - Excludes large/build/vendor folders
@@ -1341,6 +1355,105 @@ async function collectWorkspaceContext(wsRoot: vscode.Uri, output: vscode.Output
 
   logDuration(output, "Workspace context collection complete", startedAt, `${results.length} file(s), ${totalChars} chars`);
   return results;
+}
+
+function buildTaskJumpLinks(wsRoot: vscode.Uri, plan: ScaffoldPlan): TaskJumpLink[] {
+  const maskedByRel = new Map<string, string>();
+  for (const mf of plan.maskedFiles) {
+    try {
+      maskedByRel.set(normalizeRelativePath(mf.path), mf.content);
+    } catch {
+      // ignore invalid paths
+    }
+  }
+
+  const links: TaskJumpLink[] = [];
+  for (const task of plan.tasks) {
+    let rel: string;
+    try {
+      rel = normalizeRelativePath(task.path);
+    } catch {
+      continue;
+    }
+
+    const content = maskedByRel.get(rel);
+    if (!content) { continue; }
+
+    const regions = listTaskRegions(content);
+    const region = regions.find((r) => r.id === task.id);
+    if (!region) { continue; }
+
+    const line = getRegionStartLine(content, region.startTokenStart);
+    const fileUri = vscode.Uri.joinPath(wsRoot, ...rel.split("/"));
+    const query = new URLSearchParams({ path: fileUri.fsPath, line: String(line) }).toString();
+    const uri = `vscode://${EXTENSION_URI_ID}/openTaskLink?${query}`;
+    links.push({ id: task.id, rel, line, uri });
+  }
+
+  links.sort((a, b) => a.rel.localeCompare(b.rel) || a.line - b.line || a.id.localeCompare(b.id));
+  return links;
+}
+
+function prependTaskLinksSection(exercisesMd: string, links: TaskJumpLink[]): string {
+  if (links.length === 0) { return exercisesMd; }
+
+  const lines = [
+    "# Task Links",
+    "",
+    ...links.map((link) => `- **${link.id}**: [${link.rel}:${link.line}](${link.uri})`),
+    "",
+    "---",
+    "",
+  ];
+
+  return lines.join("\n") + exercisesMd;
+}
+
+function pickTaskLinkViewColumn(): vscode.ViewColumn {
+  const visibleFileEditors = vscode.window.visibleTextEditors.filter((editor) => {
+    if (!editor.viewColumn) { return false; }
+    if (editor.document.uri.scheme !== "file") { return false; }
+    return true;
+  });
+  const activeEditor = vscode.window.activeTextEditor;
+  const activeColumn = activeEditor?.viewColumn;
+  const activeBase = activeEditor ? path.posix.basename(activeEditor.document.uri.path).toLowerCase() : "";
+  const visibleCodeEditors = visibleFileEditors.filter((editor) => {
+    const base = path.posix.basename(editor.document.uri.path).toLowerCase();
+    return base !== "learning_exercises.md";
+  });
+
+  if (lastTaskLinkColumn && visibleFileEditors.some((editor) => editor.viewColumn === lastTaskLinkColumn)) {
+    return lastTaskLinkColumn;
+  }
+
+  // Common workflow: markdown source on the left, preview on the right.
+  // In that case, reuse the source markdown column instead of creating a third pane.
+  if (activeEditor?.viewColumn && activeBase === "learning_exercises.md") {
+    return activeEditor.viewColumn;
+  }
+
+  const otherVisibleEditor = visibleCodeEditors.find((editor) => editor.viewColumn !== activeColumn);
+  if (otherVisibleEditor?.viewColumn) {
+    return otherVisibleEditor.viewColumn;
+  }
+
+  const sameColumnEditor = visibleCodeEditors.find((editor) => editor.viewColumn);
+  if (sameColumnEditor?.viewColumn) {
+    return sameColumnEditor.viewColumn;
+  }
+
+  const sameColumnFileEditor = visibleFileEditors.find((editor) => editor.viewColumn === activeColumn);
+  if (sameColumnFileEditor?.viewColumn) {
+    return sameColumnFileEditor.viewColumn;
+  }
+
+  const anyFileEditor = visibleFileEditors.find((editor) => editor.viewColumn);
+  if (anyFileEditor?.viewColumn) {
+    return anyFileEditor.viewColumn;
+  }
+
+  return vscode.ViewColumn.Beside;
 }
 
 //#endregion
@@ -2231,6 +2344,55 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  context.subscriptions.push(
+    vscode.window.registerUriHandler({
+      handleUri: async (uri: vscode.Uri) => {
+        const route = uri.path.replace(/^\/+/, "");
+        if (route !== "openTaskLink") {
+          return;
+        }
+
+        const params = new URLSearchParams(uri.query);
+        const pathParam = params.get("path");
+        const lineParam = params.get("line");
+        const line = Number(lineParam ?? "1");
+        if (!pathParam || !Number.isFinite(line)) {
+          return;
+        }
+
+        await vscode.commands.executeCommand("learningCopilot.openTaskLink", {
+          path: pathParam,
+          line,
+        } satisfies TaskJumpTarget);
+      },
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("learningCopilot.openTaskLink", async (target?: TaskJumpTarget) => {
+      if (!target?.path || typeof target.line !== "number") {
+        return;
+      }
+
+      try {
+        const uri = vscode.Uri.file(target.path);
+        const doc = await vscode.workspace.openTextDocument(uri);
+        const line = Math.max(0, target.line - 1);
+        const pos = new vscode.Position(line, 0);
+        const editor = await vscode.window.showTextDocument(doc, {
+          viewColumn: pickTaskLinkViewColumn(),
+          preview: true,
+          preserveFocus: false,
+          selection: new vscode.Range(pos, pos),
+        });
+        lastTaskLinkColumn = editor.viewColumn;
+        editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
+      } catch (err: any) {
+        vscode.window.showErrorMessage(`Failed to open task location: ${err?.message ?? String(err)}`);
+      }
+    })
+  );
+
   // Save Last Output
   context.subscriptions.push(
     vscode.commands.registerCommand("learningCopilot.saveLastOutput", async () => {
@@ -2450,7 +2612,7 @@ export async function activate(context: vscode.ExtensionContext) {
         "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
         'Schema: {"files":[{"path":string,"content":string,"overwrite":boolean?}],"notes":string?}. ' +
         "All paths must be relative to the workspace root and must not contain '..' or start with '/'. " +
-        "Prefer a minimal set of files. " +
+        "Prefer best practice separation of concerns. " +
         "Task: " + userPrompt;
 
       output.show(true);
@@ -2704,7 +2866,11 @@ export async function activate(context: vscode.ExtensionContext) {
       }
 
       // Write exercises markdown into workspace
-      await writeWorkspaceMarkdownWithPrompt(wsRoot, "LEARNING_EXERCISES.md", scaffold.exercisesMd, "Learning tasks");
+      const exercisesWithLinks = prependTaskLinksSection(
+        scaffold.exercisesMd,
+        buildTaskJumpLinks(wsRoot, scaffold)
+      );
+      await writeWorkspaceMarkdownWithPrompt(wsRoot, "LEARNING_EXERCISES.md", exercisesWithLinks, "Learning tasks");
 
       // Save instructor answer key privately
       if (scaffold.answerKeyMd) {
@@ -3380,7 +3546,11 @@ export async function activate(context: vscode.ExtensionContext) {
             }
           );
 
-          await writeWorkspaceMarkdownWithPrompt(wsRoot, "LEARNING_EXERCISES.md", scaffold.exercisesMd, "Learning tasks");
+          const exercisesWithLinks = prependTaskLinksSection(
+            scaffold.exercisesMd,
+            buildTaskJumpLinks(wsRoot, scaffold)
+          );
+          await writeWorkspaceMarkdownWithPrompt(wsRoot, "LEARNING_EXERCISES.md", exercisesWithLinks, "Learning tasks");
 
           if (scaffold.answerKeyMd) {
             try {
