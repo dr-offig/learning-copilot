@@ -910,43 +910,82 @@ function parseScaffoldPlan(jsonText: string): ScaffoldPlan {
 }
 
 // --- Scaffold marker/comment style validation helpers ---
-function commentStyleRuleForPath(p: string): string {
+type MarkerCommentContext = "html" | "css" | "js" | "python" | "markdown" | "generic";
+
+function getMarkerCommentContextForLine(p: string, content: string, lineIndex?: number): MarkerCommentContext {
   const ext = path.posix.extname(p.toLowerCase());
   if (ext === ".html" || ext === ".htm" || ext === ".svg") {
-    return "HTML comments only: <!-- __LC_TASK_<id>_START__ --> and <!-- __LC_TASK_<id>_END__ --> on their own lines.";
+    if (typeof lineIndex === "number") {
+      const lines = content.split(/\r?\n/);
+      const prefix = lines.slice(0, lineIndex + 1).join("\n").toLowerCase();
+      const lastScriptOpen = prefix.lastIndexOf("<script");
+      const lastScriptClose = prefix.lastIndexOf("</script");
+      if (lastScriptOpen > lastScriptClose) {
+        return "js";
+      }
+      const lastStyleOpen = prefix.lastIndexOf("<style");
+      const lastStyleClose = prefix.lastIndexOf("</style");
+      if (lastStyleOpen > lastStyleClose) {
+        return "css";
+      }
+    }
+    return "html";
   }
   if (ext === ".css") {
-    return "CSS comments only: /* __LC_TASK_<id>_START__ */ and /* __LC_TASK_<id>_END__ */ on their own lines.";
+    return "css";
   }
   if ([".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"].includes(ext)) {
-    return "JS/TS comments only: // __LC_TASK_<id>_START__ and // __LC_TASK_<id>_END__ (or /* ... */) on their own lines.";
+    return "js";
   }
   if ([".py"].includes(ext)) {
-    return "Python comments only: # __LC_TASK_<id>_START__ and # __LC_TASK_<id>_END__ on their own lines.";
+    return "python";
   }
   if ([".md"].includes(ext)) {
+    return "markdown";
+  }
+  return "generic";
+}
+
+function commentStyleRuleForPath(p: string, content = "", lineIndex?: number): string {
+  const context = getMarkerCommentContextForLine(p, content, lineIndex);
+  if (context === "html") {
+    return "HTML comments only: <!-- __LC_TASK_<id>_START__ --> and <!-- __LC_TASK_<id>_END__ --> on their own lines.";
+  }
+  if (context === "css") {
+    return "CSS comments only: /* __LC_TASK_<id>_START__ */ and /* __LC_TASK_<id>_END__ */ on their own lines.";
+  }
+  if (context === "js") {
+    return "JS/TS comments only: // __LC_TASK_<id>_START__ and // __LC_TASK_<id>_END__ (or /* ... */) on their own lines.";
+  }
+  if (context === "python") {
+    return "Python comments only: # __LC_TASK_<id>_START__ and # __LC_TASK_<id>_END__ on their own lines.";
+  }
+  if (context === "markdown") {
     return "Markdown/HTML comments preferred: <!-- __LC_TASK_<id>_START__ --> and <!-- __LC_TASK_<id>_END__ --> on their own lines.";
   }
-  // Fallback: allow //, /* */, or #
   return "Markers must be standalone comment lines appropriate to the language/file type.";
 }
 
-function getExpectedMarkerLineRegexForPath(p: string, which: "START" | "END"): RegExp {
-  const ext = path.posix.extname(p.toLowerCase());
+function getExpectedMarkerLineRegexForPath(
+  p: string,
+  which: "START" | "END",
+  content = "",
+  lineIndex?: number
+): RegExp {
   const tok = `__LC_TASK_[A-Za-z0-9_-]+_${which}__`;
-  if (ext === ".html" || ext === ".htm" || ext === ".svg" || ext === ".md") {
+  const context = getMarkerCommentContextForLine(p, content, lineIndex);
+  if (context === "html" || context === "markdown") {
     return new RegExp(`^\\s*<!--\\s*${tok}\\s*-->\\s*$`);
   }
-  if (ext === ".css") {
+  if (context === "css") {
     return new RegExp(`^\\s*\\/\\*\\s*${tok}\\s*\\*\\/\\s*$`);
   }
-  if ([".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"].includes(ext)) {
+  if (context === "js") {
     return new RegExp(`^\\s*(?:\\/\\/\\s*${tok}\\s*|\\/\\*\\s*${tok}\\s*\\*\\/)\\s*$`);
   }
-  if (ext === ".py") {
+  if (context === "python") {
     return new RegExp(`^\\s*#\\s*${tok}\\s*$`);
   }
-  // permissive fallback
   return new RegExp(`^\\s*(?:\\/\\/|#|--|;|<!--|\\/\\*)?\\s*${tok}`);
 }
 
@@ -1070,8 +1109,6 @@ function validateScaffoldPlan(plan: ScaffoldPlan): ScaffoldValidationIssue[] {
       continue;
     }
 
-    const startLineRe = getExpectedMarkerLineRegexForPath(rel, "START");
-    const endLineRe = getExpectedMarkerLineRegexForPath(rel, "END");
     const lines = mf.content.split(/\r?\n/);
 
     for (const r of regions) {
@@ -1085,13 +1122,15 @@ function validateScaffoldPlan(plan: ScaffoldPlan): ScaffoldValidationIssue[] {
       const endLineIdx = mf.content.slice(0, r.endTokenStart).split(/\r?\n/).length - 1;
       const startLine = lines[startLineIdx] ?? "";
       const endLine = lines[endLineIdx] ?? "";
+      const startLineRe = getExpectedMarkerLineRegexForPath(rel, "START", mf.content, startLineIdx);
+      const endLineRe = getExpectedMarkerLineRegexForPath(rel, "END", mf.content, endLineIdx);
 
       if (!startLineRe.test(startLine) || !endLineRe.test(endLine)) {
         issues.push({
           kind: "badCommentStyle",
           file: rel,
           id: r.id,
-          detail: `Marker comment style mismatch in ${rel} for ${r.id}. Expected: ${commentStyleRuleForPath(rel)} Found START line='${startLine.trim()}', END line='${endLine.trim()}'.`,
+          detail: `Marker comment style mismatch in ${rel} for ${r.id}. Expected: ${commentStyleRuleForPath(rel, mf.content, startLineIdx)} Found START line='${startLine.trim()}', END line='${endLine.trim()}'.`,
         });
       }
 
@@ -2017,7 +2056,7 @@ async function generateLearningScaffold(
           "Do NOT include the wrapper tokens in solution. Do NOT include markdown fences. Do NOT include explanation inside the solution. Code only. " +
           // ---- INSERTED rules (5b) and (5c) here ----
           "(5b) COMMENT STYLE: The START/END marker lines must use the correct comment syntax for each file type: " +
-          "HTML (.html/.htm/.svg): <!-- __LC_TASK_<id>_START__ --> and <!-- __LC_TASK_<id>_END__ -->. " +
+          "HTML (.html/.htm/.svg): use HTML comments only for HTML markup regions, BUT inside <script> blocks use JS comments (// or /* */), and inside <style> blocks use CSS comments (/* */). " +
           "CSS (.css): /* __LC_TASK_<id>_START__ */ and /* __LC_TASK_<id>_END__ */. " +
           "JS/TS (.js/.ts/.jsx/.tsx/.mjs/.cjs): // __LC_TASK_<id>_START__ and // __LC_TASK_<id>_END__ (or /* ... */). " +
           "Python (.py): # __LC_TASK_<id>_START__ and # __LC_TASK_<id>_END__. " +
@@ -2077,7 +2116,7 @@ async function generateLearningScaffold(
             "Fix ALL of these validation issues:\n" +
             formatScaffoldIssuesForPrompt(issues) +
             "\n\nRules to follow: " +
-            "- Use correct per-file comment syntax for marker lines (HTML uses <!-- -->, CSS uses /* */, JS uses // or /* */, etc.). " +
+            "- Use correct per-file comment syntax for marker lines. In HTML files, use HTML comments only in markup, JS comments inside <script>, and CSS comments inside <style>. " +
             "- Markers must be on their own lines and contain only the token + comment delimiters. " +
             "- Placeholder between markers must NOT equal the solution; it must be incomplete so the student must edit. " +
             "- maskedFiles may only include input paths. " +
@@ -2218,7 +2257,7 @@ async function generateLearningScaffoldFocused(
           "Markers MUST appear on their own lines as standalone comments containing only the token (plus comment delimiters). Do not place marker tokens inline with code. " +
           "(5) Every task region MUST have a corresponding entry in the 'tasks' array. " +
           "(6) 'solution' must be ONLY the replacement code between markers (no tokens). " +
-          "(7) COMMENT STYLE for marker lines must match file type (HTML uses <!-- -->, CSS uses /* */, JS uses // or /* */, Python uses #). " +
+          "(7) COMMENT STYLE for marker lines must match file type. In HTML files, use HTML comments only in markup, JS comments inside <script>, and CSS comments inside <style>. CSS uses /* */, JS uses // or /* */, Python uses #. " +
           "(8) Placeholder between markers MUST be incomplete/incorrect compared to solution. " +
           "(9) exercisesMd must focus on the new/modified functionality, reference task IDs, and include a section titled 'Comprehension Questions'. " +
           "In that section, include at least 5 questions, EACH tagged with a stable identifier like [CQ1], [CQ2], ... (include the tag literally in the question line). " +
@@ -2297,7 +2336,7 @@ async function generateLearningScaffoldFocused(
             "Output schema MUST remain: {\"maskedFiles\":[{\"path\":string,\"content\":string}],\"tasks\":[{\"id\":string,\"path\":string,\"solution\":string,\"hint\":string?,\"explanation\":string?}],\"exercisesMd\":string,\"answerKeyMd\":string?,\"notes\":string?}. " +
             "Fix ALL of these validation issues:\n" +
             formatScaffoldIssuesForPrompt(issues) +
-            "\n\nRules: maskedFiles/tasks must stay restricted to focusFiles. Use correct marker comment style. Placeholder must differ from solution. " +
+            "\n\nRules: maskedFiles/tasks must stay restricted to focusFiles. Use correct marker comment style. In HTML files, use HTML comments only in markup, JS comments inside <script>, and CSS comments inside <style>. Placeholder must differ from solution. " +
             "- exercisesMd must include comprehension questions tagged [CQ1].. and answerKeyMd must include a 'Comprehension Answers' section with matching tags. " +
             "Focus files (JSON array): " +
             JSON.stringify(focusPayload) +
