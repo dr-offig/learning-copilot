@@ -68,6 +68,7 @@ type ScaffoldTask = {
   solution: string;
   hint?: string;
   explanation?: string;
+  completed?: boolean;
 };
 
 type ScaffoldPlan = {
@@ -652,7 +653,11 @@ async function importArtifactsIntoWorkspace(
   wsRoot: vscode.Uri,
   files: Array<{ rel: string; abs: string }>
 ): Promise<WrittenFile[]> {
-  const written: WrittenFile[] = [];
+  if (files.length === 0) {
+    return [];
+  }
+
+  const normalizedFiles: Array<{ rel: string; abs: string; exists: boolean }> = [];
   for (const file of files) {
     let rel: string;
     try {
@@ -662,50 +667,36 @@ async function importArtifactsIntoWorkspace(
       continue;
     }
 
-    const content = await fsp.readFile(file.abs, "utf8");
-
     const targetUri = vscode.Uri.joinPath(wsRoot, ...rel.split("/"));
     const exists = await vscode.workspace.fs.stat(targetUri).then(() => true, () => false);
+    normalizedFiles.push({ rel, abs: file.abs, exists });
+  }
 
-    const proposedKey = `artifact/${rel}`;
-    proposedContent.set(proposedKey, content);
-    const proposedUri = vscode.Uri.parse(`${PROPOSED_SCHEME}:/${proposedKey}`);
+  if (normalizedFiles.length === 0) {
+    return [];
+  }
 
-    const title = exists
-      ? `Import Copilot artifact: ${rel} (overwrite existing?)`
-      : `Import Copilot artifact: ${rel} (create?)`;
+  const overwriteCount = normalizedFiles.filter((file) => file.exists).length;
+  const createCount = normalizedFiles.length - overwriteCount;
+  const actionLabel = overwriteCount > 0 ? "Apply All" : "Create All";
+  const pick = await vscode.window.showInformationMessage(
+    `Import ${normalizedFiles.length} Copilot artifact file(s)? This will ${overwriteCount > 0 ? `overwrite ${overwriteCount} existing and create ${createCount} new` : `create ${createCount} new`} file(s).`,
+    { modal: true },
+    actionLabel,
+    "Skip"
+  );
+  if (pick !== actionLabel) {
+    return [];
+  }
 
-    while (true) {
-      const pick = await vscode.window.showInformationMessage(
-        title,
-        { modal: true },
-        "Preview",
-        exists ? "Overwrite" : "Create",
-        "Skip"
-      );
-
-      if (!pick || pick === "Skip") { break; }
-
-      if (pick === "Preview") {
-        if (exists) {
-          await vscode.commands.executeCommand("vscode.diff", targetUri, proposedUri, `Artifact import: ${rel}`);
-        } else {
-          const emptyKey = `empty/${rel}`;
-          proposedContent.set(emptyKey, "");
-          const emptyUri = vscode.Uri.parse(`${PROPOSED_SCHEME}:/${emptyKey}`);
-          await vscode.commands.executeCommand("vscode.diff", emptyUri, proposedUri, `Artifact import: ${rel}`);
-        }
-        continue;
-      }
-
-      if (pick === "Overwrite" || pick === "Create") {
-        await ensureDirForFile(targetUri);
-        await vscode.workspace.fs.writeFile(targetUri, Buffer.from(content, "utf8"));
-        written.push({ rel, fullContent: content });
-        vscode.window.showInformationMessage(`${exists ? "Updated" : "Created"}: ${rel}`);
-        break;
-      }
-    }
+  const written: WrittenFile[] = [];
+  for (const file of normalizedFiles) {
+    const content = await fsp.readFile(file.abs, "utf8");
+    const targetUri = vscode.Uri.joinPath(wsRoot, ...file.rel.split("/"));
+    await ensureDirForFile(targetUri);
+    await vscode.workspace.fs.writeFile(targetUri, Buffer.from(content, "utf8"));
+    written.push({ rel: file.rel, fullContent: content });
+    vscode.window.showInformationMessage(`${file.exists ? "Updated" : "Created"}: ${file.rel}`);
   }
   return written;
 }
@@ -1166,42 +1157,20 @@ async function writeWorkspaceMarkdownWithPrompt(
   const targetUri = vscode.Uri.joinPath(wsRoot, filename);
   const exists = await vscode.workspace.fs.stat(targetUri).then(() => true, () => false);
 
-  const proposedKey = `proposed/${filename}`;
-  proposedContent.set(proposedKey, content);
-  const proposedUri = vscode.Uri.parse(`${PROPOSED_SCHEME}:/${proposedKey}`);
-
   const title = exists
     ? `${titlePrefix}: ${filename} (overwrite existing?)`
     : `${titlePrefix}: ${filename} (create?)`;
 
-  while (true) {
-    const pick = await vscode.window.showInformationMessage(
-      title,
-      { modal: true },
-      "Preview",
-      exists ? "Overwrite" : "Create",
-      "Skip"
-    );
+  const pick = await vscode.window.showInformationMessage(
+    title,
+    { modal: true },
+    exists ? "Overwrite" : "Create",
+    "Skip"
+  );
 
-    if (!pick || pick === "Skip") { return; }
-
-    if (pick === "Preview") {
-      if (exists) {
-        await vscode.commands.executeCommand("vscode.diff", targetUri, proposedUri, `${titlePrefix}: ${filename}`);
-      } else {
-        const emptyKey = `empty/${filename}`;
-        proposedContent.set(emptyKey, "");
-        const emptyUri = vscode.Uri.parse(`${PROPOSED_SCHEME}:/${emptyKey}`);
-        await vscode.commands.executeCommand("vscode.diff", emptyUri, proposedUri, `${titlePrefix}: ${filename}`);
-      }
-      continue;
-    }
-
-    if (pick === "Overwrite" || pick === "Create") {
-      await vscode.workspace.fs.writeFile(targetUri, Buffer.from(content, "utf8"));
-      vscode.window.showInformationMessage(`${exists ? "Updated" : "Created"}: ${filename}`);
-      return;
-    }
+  if (pick === "Overwrite" || pick === "Create") {
+    await vscode.workspace.fs.writeFile(targetUri, Buffer.from(content, "utf8"));
+    vscode.window.showInformationMessage(`${exists ? "Updated" : "Created"}: ${filename}`);
   }
 }
 
@@ -1276,6 +1245,9 @@ type TaskJumpTarget = {
   path: string;
   line: number;
 };
+
+const TASK_LINKS_START = "<!-- LC_TASK_LINKS_START -->";
+const TASK_LINKS_END = "<!-- LC_TASK_LINKS_END -->";
 
 /**
  * Collects a limited snapshot of workspace files to provide Copilot with context.
@@ -1394,19 +1366,102 @@ function buildTaskJumpLinks(wsRoot: vscode.Uri, plan: ScaffoldPlan): TaskJumpLin
   return links;
 }
 
-function prependTaskLinksSection(exercisesMd: string, links: TaskJumpLink[]): string {
-  if (links.length === 0) { return exercisesMd; }
+function getTaskStateKey(rel: string, id: string): string {
+  return `${rel}::${id}`;
+}
 
+function getCompletedTaskKeySet(tasks: ScaffoldTask[]): Set<string> {
+  const out = new Set<string>();
+  for (const task of tasks) {
+    if (!task.completed) { continue; }
+    try {
+      out.add(getTaskStateKey(normalizeRelativePath(task.path), task.id));
+    } catch {
+      // ignore invalid paths
+    }
+  }
+  return out;
+}
+
+function buildTaskLinksSection(links: TaskJumpLink[], completed: Set<string>): string {
   const lines = [
     "# Task Links",
     "",
-    ...links.map((link) => `- **${link.id}**: [${link.rel}:${link.line}](${link.uri})`),
-    "",
-    "---",
+    ...links.map((link) => {
+      const checked = completed.has(getTaskStateKey(link.rel, link.id)) ? "x" : " ";
+      return `- [${checked}] **${link.id}**: [${link.rel}:${link.line}](${link.uri}) <!-- LC_TASK_LINK|${link.rel}|${link.id} -->`;
+    }),
     "",
   ];
 
-  return lines.join("\n") + exercisesMd;
+  return [TASK_LINKS_START, ...lines, TASK_LINKS_END].join("\n");
+}
+
+function prependTaskLinksSection(exercisesMd: string, links: TaskJumpLink[], tasks: ScaffoldTask[]): string {
+  if (links.length === 0) { return exercisesMd; }
+
+  const block = buildTaskLinksSection(links, getCompletedTaskKeySet(tasks));
+  return `${block}\n\n---\n\n${exercisesMd}`;
+}
+
+function refreshTaskLinksSection(content: string, completed: Set<string>): string {
+  const re = /^- \[[ x]\] \*\*([^*]+)\*\*: \[[^\]]+\]\([^)]+\) <!-- LC_TASK_LINK\|([^|]+)\|([^>]+) -->$/gm;
+  return content.replace(re, (_full, _displayId, rel, id) => {
+    const checked = completed.has(getTaskStateKey(rel, id)) ? "x" : " ";
+    return _full.replace(/^(- \[)[ x](\])/, `$1${checked}$2`);
+  });
+}
+
+async function syncLearningExercisesTaskStatuses(
+  context: vscode.ExtensionContext,
+  wsRoot: vscode.Uri
+): Promise<void> {
+  const targetUri = vscode.Uri.joinPath(wsRoot, "LEARNING_EXERCISES.md");
+  let bytes: Uint8Array;
+  try {
+    bytes = await vscode.workspace.fs.readFile(targetUri);
+  } catch {
+    return;
+  }
+
+  const content = Buffer.from(bytes).toString("utf8");
+  if (!content.includes(TASK_LINKS_START) || !content.includes(TASK_LINKS_END)) {
+    return;
+  }
+
+  const updated = refreshTaskLinksSection(
+    content,
+    getCompletedTaskKeySet(context.globalState.get<ScaffoldTask[]>("learningCopilot.lastScaffoldTasks") ?? [])
+  );
+  if (updated === content) {
+    return;
+  }
+
+  await vscode.workspace.fs.writeFile(targetUri, Buffer.from(updated, "utf8"));
+}
+
+async function markTasksCompleted(
+  context: vscode.ExtensionContext,
+  wsRoot: vscode.Uri,
+  taskKeys: string[]
+): Promise<void> {
+  if (taskKeys.length === 0) { return; }
+
+  const keys = new Set(taskKeys);
+  const all = context.globalState.get<ScaffoldTask[]>("learningCopilot.lastScaffoldTasks") ?? [];
+  const updated = all.map((task) => {
+    try {
+      const rel = normalizeRelativePath(task.path);
+      if (keys.has(getTaskStateKey(rel, task.id))) {
+        return { ...task, completed: true };
+      }
+    } catch {
+      // ignore invalid paths
+    }
+    return task;
+  });
+  await context.globalState.update("learningCopilot.lastScaffoldTasks", updated);
+  await syncLearningExercisesTaskStatuses(context, wsRoot);
 }
 
 function pickTaskLinkViewColumn(): vscode.ViewColumn {
@@ -1629,7 +1684,7 @@ function getTaskById(context: vscode.ExtensionContext, rel: string, id: string):
   const all = context.globalState.get<ScaffoldTask[]>("learningCopilot.lastScaffoldTasks") ?? [];
   for (const b of all) {
     try {
-      if (normalizeRelativePath(b.path) === rel && b.id === id) { return b; }
+      if (normalizeRelativePath(b.path) === rel && b.id === id && !b.completed) { return b; }
     } catch {}
   }
   return null;
@@ -1641,12 +1696,13 @@ async function restoreAllTasksInWorkspace(
 ): Promise<{
   filesUpdated: number;
   tasksApplied: number;
+  appliedTaskKeys: string[];
   missingFiles: string[];
   missingMappings: string[];
 }> {
   const allTasks = context.globalState.get<ScaffoldTask[]>("learningCopilot.lastScaffoldTasks") ?? [];
   if (allTasks.length === 0) {
-    return { filesUpdated: 0, tasksApplied: 0, missingFiles: [], missingMappings: [] };
+    return { filesUpdated: 0, tasksApplied: 0, appliedTaskKeys: [], missingFiles: [], missingMappings: [] };
   }
 
   const tasksByFile = new Map<string, Map<string, ScaffoldTask>>();
@@ -1664,6 +1720,7 @@ async function restoreAllTasksInWorkspace(
 
   let filesUpdated = 0;
   let tasksApplied = 0;
+  const appliedTaskKeys: string[] = [];
   const missingFiles: string[] = [];
   const missingMappings: string[] = [];
 
@@ -1694,6 +1751,7 @@ async function restoreAllTasksInWorkspace(
       const insert = task.solution.endsWith("\n") ? task.solution : task.solution + "\n";
       const { range, replacement } = buildReplacementForRegion(doc, region, insert, true);
       edit.replace(doc.uri, range, replacement);
+      appliedTaskKeys.push(getTaskStateKey(rel, region.id));
     }
 
     const applied = await vscode.workspace.applyEdit(edit);
@@ -1706,7 +1764,7 @@ async function restoreAllTasksInWorkspace(
     tasksApplied += regions.length;
   }
 
-  return { filesUpdated, tasksApplied, missingFiles, missingMappings };
+  return { filesUpdated, tasksApplied, appliedTaskKeys, missingFiles, missingMappings };
 }
 
 
@@ -2703,8 +2761,7 @@ export async function activate(context: vscode.ExtensionContext) {
         const choice = await vscode.window.showInformationMessage(
           `Copilot produced file artifacts (${artifacts.length}): ${names}${more}. Import into the workspace?`,
           { modal: true },
-          "Import",
-          "Cancel"
+          "Import"
         );
         if (choice !== "Import") {
           vscode.window.showInformationMessage("Learning Copilot: Import cancelled.");
@@ -2723,6 +2780,26 @@ export async function activate(context: vscode.ExtensionContext) {
       }
 
       if (plan) {
+        const overwriteCount = await Promise.all(
+          plan.files.map(async (f) => {
+            const rel = normalizeRelativePath(f.path);
+            const targetUri = vscode.Uri.joinPath(wsRoot, ...rel.split("/"));
+            return await vscode.workspace.fs.stat(targetUri).then(() => 1, () => 0);
+          })
+        ).then((counts) => counts.reduce((sum, count) => sum + count, 0));
+        const createCount = plan.files.length - overwriteCount;
+        const applyLabel = overwriteCount > 0 ? "Apply All" : "Create All";
+        const applyChoice = await vscode.window.showInformationMessage(
+          `Apply ${plan.files.length} generated file(s)? This will ${overwriteCount > 0 ? `overwrite ${overwriteCount} existing and create ${createCount} new` : `create ${createCount} new`} file(s).`,
+          { modal: true },
+          applyLabel,
+          "Skip"
+        );
+        if (applyChoice !== applyLabel) {
+          vscode.window.showInformationMessage("Learning Copilot: File generation cancelled.");
+          return;
+        }
+
         for (const f of plan.files) {
           let rel: string;
           try {
@@ -2734,48 +2811,13 @@ export async function activate(context: vscode.ExtensionContext) {
 
           const targetUri = vscode.Uri.joinPath(wsRoot, ...rel.split("/"));
           const exists = await vscode.workspace.fs.stat(targetUri).then(() => true, () => false);
-
-          const proposedKey = `proposed/${rel}`;
-          proposedContent.set(proposedKey, f.content);
-          const proposedUri = vscode.Uri.parse(`${PROPOSED_SCHEME}:/${proposedKey}`);
-
-          const title = exists ? `Write ${rel} (overwrite existing?)` : `Write ${rel} (create?)`;
-
-          // loop to allow repeated preview
-          while (true) {
-            const pick = await vscode.window.showInformationMessage(
-              title,
-              { modal: true },
-              "Preview",
-              exists ? "Overwrite" : "Create",
-              "Skip"
-            );
-
-            if (!pick || pick === "Skip") { break; }
-
-            if (pick === "Preview") {
-              if (exists) {
-                await vscode.commands.executeCommand("vscode.diff", targetUri, proposedUri, `Learning Copilot: ${rel}`);
-              } else {
-                const emptyKey = `empty/${rel}`;
-                proposedContent.set(emptyKey, "");
-                const emptyUri = vscode.Uri.parse(`${PROPOSED_SCHEME}:/${emptyKey}`);
-                await vscode.commands.executeCommand("vscode.diff", emptyUri, proposedUri, `Learning Copilot: ${rel}`);
-              }
-              continue;
-            }
-
-            if (pick === "Overwrite" || pick === "Create") {
-              try {
-                await ensureDirForFile(targetUri);
-                await vscode.workspace.fs.writeFile(targetUri, Buffer.from(f.content, "utf8"));
-                writtenFiles.push({ rel, fullContent: f.content });
-                vscode.window.showInformationMessage(`${exists ? "Updated" : "Created"}: ${rel}`);
-              } catch (e: any) {
-                vscode.window.showErrorMessage(`Failed to write ${rel}: ${e?.message ?? String(e)}`);
-              }
-              break;
-            }
+          try {
+            await ensureDirForFile(targetUri);
+            await vscode.workspace.fs.writeFile(targetUri, Buffer.from(f.content, "utf8"));
+            writtenFiles.push({ rel, fullContent: f.content });
+            vscode.window.showInformationMessage(`${exists ? "Updated" : "Created"}: ${rel}`);
+          } catch (e: any) {
+            vscode.window.showErrorMessage(`Failed to write ${rel}: ${e?.message ?? String(e)}`);
           }
         }
       }
@@ -2822,7 +2864,10 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      await context.globalState.update("learningCopilot.lastScaffoldTasks", scaffold.tasks);
+      await context.globalState.update(
+        "learningCopilot.lastScaffoldTasks",
+        scaffold.tasks.map((task) => ({ ...task, completed: false }))
+      );
 
       if (scaffold.notes) {
         output.appendLine("--- scaffold notes ---");
@@ -2868,7 +2913,8 @@ export async function activate(context: vscode.ExtensionContext) {
       // Write exercises markdown into workspace
       const exercisesWithLinks = prependTaskLinksSection(
         scaffold.exercisesMd,
-        buildTaskJumpLinks(wsRoot, scaffold)
+        buildTaskJumpLinks(wsRoot, scaffold),
+        scaffold.tasks
       );
       await writeWorkspaceMarkdownWithPrompt(wsRoot, "LEARNING_EXERCISES.md", exercisesWithLinks, "Learning tasks");
 
@@ -2972,6 +3018,7 @@ export async function activate(context: vscode.ExtensionContext) {
       // await editor.edit((eb) => eb.replace(range, insert));
       
       await applySolutionForRegion(editor, editor.document, hit, insert, true);
+      await markTasksCompleted(context, wsRoot, [getTaskStateKey(rel, hit.id)]);
       vscode.window.showInformationMessage(`Applied solution for task ${hit.id} (markers removed).`);
     })
   );
@@ -3000,6 +3047,7 @@ export async function activate(context: vscode.ExtensionContext) {
    
       //await editor.edit((eb) => eb.replace(range, insert));
       await applySolutionForRegion(editor, editor.document, next, insert, true);
+      await markTasksCompleted(context, wsRoot, [getTaskStateKey(rel, next.id)]);
 
       editor.selection = new vscode.Selection(newPos, newPos);
       editor.revealRange(new vscode.Range(newPos, newPos));
@@ -3035,6 +3083,7 @@ export async function activate(context: vscode.ExtensionContext) {
           tasksApplied = result.tasksApplied;
           missingFiles.push(...result.missingFiles);
           missingMappings.push(...result.missingMappings);
+          await markTasksCompleted(context, wsRoot, result.appliedTaskKeys);
         }
       );
 
@@ -3124,8 +3173,7 @@ export async function activate(context: vscode.ExtensionContext) {
       const confirm = await vscode.window.showInformationMessage(
         `Mark task '${hit.id}' as done? This will remove its START/END markers but keep the current content.`,
         { modal: true },
-        "Mark Done",
-        "Cancel"
+        "Mark Done"
       );
       if (confirm !== "Mark Done") {return;}
 
@@ -3184,10 +3232,7 @@ export async function activate(context: vscode.ExtensionContext) {
           .forEach((e) => eb.replace(e.range, e.replacement));
       });
 
-      // Optional: remove this task from stored mapping so it’s not offered anymore
-      const all = context.globalState.get<ScaffoldTask[]>("learningCopilot.lastScaffoldTasks") ?? [];
-      const filtered = all.filter((b) => !(normalizeRelativePath(b.path) === rel && b.id === hit.id));
-      await context.globalState.update("learningCopilot.lastScaffoldTasks", filtered);
+      await markTasksCompleted(context, wsRoot, [getTaskStateKey(rel, hit.id)]);
 
       vscode.window.showInformationMessage(`Marked task as done: ${hit.id}`);
     })
@@ -3244,6 +3289,19 @@ export async function activate(context: vscode.ExtensionContext) {
         },
         async (progress) => {
           const modifyStartedAt = Date.now();
+          const allTasks = context.globalState.get<ScaffoldTask[]>("learningCopilot.lastScaffoldTasks") ?? [];
+          const remainingTasks = allTasks.filter((task) => !task.completed);
+          if (remainingTasks.length > 0) {
+            const choice = await vscode.window.showWarningMessage(
+              `There ${remainingTasks.length === 1 ? "is" : "are"} ${remainingTasks.length} unfinished task${remainingTasks.length === 1 ? "" : "s"}. Modifying the workspace will first apply all remaining solutions and may overwrite student work. Continue?`,
+              { modal: true },
+              "Continue"
+            );
+            if (choice !== "Continue") {
+              setBusyStatus(null);
+              return;
+            }
+          }
 
           reportActivity(progress, output, modifyStartedAt, "Step 1/5: Restoring solved workspace from existing tasks…", "Step 1/5: Restoring solved workspace");
           const restoreResult = await restoreAllTasksInWorkspace(context, wsRoot);
@@ -3384,6 +3442,27 @@ export async function activate(context: vscode.ExtensionContext) {
           const writtenFiles: WrittenFile[] = [];
           const oldContentByRel = new Map<string, string>();
 
+          const overwriteCount = await Promise.all(
+            plan.files.map(async (f) => {
+              const rel = normalizeRelativePath(f.path);
+              const targetUri = vscode.Uri.joinPath(wsRoot, ...rel.split("/"));
+              return await vscode.workspace.fs.stat(targetUri).then(() => 1, () => 0);
+            })
+          ).then((counts) => counts.reduce((sum, count) => sum + count, 0));
+          const createCount = plan.files.length - overwriteCount;
+          const applyLabel = overwriteCount > 0 ? "Apply All" : "Create All";
+          const applyChoice = await vscode.window.showInformationMessage(
+            `Apply ${plan.files.length} workspace change(s)? This will ${overwriteCount > 0 ? `overwrite ${overwriteCount} existing and create ${createCount} new` : `create ${createCount} new`} file(s).`,
+            { modal: true },
+            applyLabel,
+            "Skip"
+          );
+          if (applyChoice !== applyLabel) {
+            vscode.window.showInformationMessage("No changes applied.");
+            setBusyStatus(null);
+            return;
+          }
+
           for (const f of plan.files) {
             let rel: string;
             try {
@@ -3396,56 +3475,23 @@ export async function activate(context: vscode.ExtensionContext) {
             const targetUri = vscode.Uri.joinPath(wsRoot, ...rel.split("/"));
             const exists = await vscode.workspace.fs.stat(targetUri).then(() => true, () => false);
 
-            const proposedKey = `proposed/${rel}`;
-            proposedContent.set(proposedKey, f.content);
-            const proposedUri = vscode.Uri.parse(`${PROPOSED_SCHEME}:/${proposedKey}`);
-
-            const title = exists ? `Apply change: ${rel} (overwrite existing?)` : `Apply change: ${rel} (create?)`;
-
-            while (true) {
-              const pick = await vscode.window.showInformationMessage(
-                title,
-                { modal: true },
-                "Preview",
-                exists ? "Overwrite" : "Create",
-                "Skip"
-              );
-
-              if (!pick || pick === "Skip") {break;}
-
-              if (pick === "Preview") {
-                if (exists) {
-                  await vscode.commands.executeCommand("vscode.diff", targetUri, proposedUri, `Proposed change: ${rel}`);
-                } else {
-                  const emptyKey = `empty/${rel}`;
-                  proposedContent.set(emptyKey, "");
-                  const emptyUri = vscode.Uri.parse(`${PROPOSED_SCHEME}:/${emptyKey}`);
-                  await vscode.commands.executeCommand("vscode.diff", emptyUri, proposedUri, `Proposed new file: ${rel}`);
-                }
-                continue;
+            // make note of the old content before overwriting, so we can use it as context for focused scaffold generation later
+            if (exists) {
+              try {
+                const oldBytes = await vscode.workspace.fs.readFile(targetUri);
+                oldContentByRel.set(rel, Buffer.from(oldBytes).toString("utf8"));
+              } catch {
+                oldContentByRel.set(rel, "");
               }
-
-              if (pick === "Overwrite" || pick === "Create") {
-                // make note of the old content before overwriting, so we can use it as context for focused scaffold generation later
-                if (exists) {
-                  try {
-                    const oldBytes = await vscode.workspace.fs.readFile(targetUri);
-                    oldContentByRel.set(rel, Buffer.from(oldBytes).toString("utf8"));
-                  } catch {
-                    oldContentByRel.set(rel, "");
-                  }
-                } else {
-                  oldContentByRel.set(rel, "");
-                }
-                
-                // now overwrite (or create) the file with the new content
-                await ensureDirForFile(targetUri);
-                await vscode.workspace.fs.writeFile(targetUri, Buffer.from(f.content, "utf8"));
-                writtenFiles.push({ rel, fullContent: f.content });
-                vscode.window.showInformationMessage(`${exists ? "Updated" : "Created"}: ${rel}`);
-                break;
-              }
+            } else {
+              oldContentByRel.set(rel, "");
             }
+
+            // now overwrite (or create) the file with the new content
+            await ensureDirForFile(targetUri);
+            await vscode.workspace.fs.writeFile(targetUri, Buffer.from(f.content, "utf8"));
+            writtenFiles.push({ rel, fullContent: f.content });
+            vscode.window.showInformationMessage(`${exists ? "Updated" : "Created"}: ${rel}`);
           }
 
           if (!writtenFiles.length) {
@@ -3516,7 +3562,10 @@ export async function activate(context: vscode.ExtensionContext) {
             return;
           }
 
-          await context.globalState.update("learningCopilot.lastScaffoldTasks", scaffold.tasks);
+          await context.globalState.update(
+            "learningCopilot.lastScaffoldTasks",
+            scaffold.tasks.map((task) => ({ ...task, completed: false }))
+          );
 
           // Apply masked files only to the files we just changed (auto-overwrite)
           const changedSet = new Set(writtenFiles.map((w) => normalizeRelativePath(w.rel)));
@@ -3548,7 +3597,8 @@ export async function activate(context: vscode.ExtensionContext) {
 
           const exercisesWithLinks = prependTaskLinksSection(
             scaffold.exercisesMd,
-            buildTaskJumpLinks(wsRoot, scaffold)
+            buildTaskJumpLinks(wsRoot, scaffold),
+            scaffold.tasks
           );
           await writeWorkspaceMarkdownWithPrompt(wsRoot, "LEARNING_EXERCISES.md", exercisesWithLinks, "Learning tasks");
 
