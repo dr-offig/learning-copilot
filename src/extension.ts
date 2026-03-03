@@ -9,6 +9,9 @@ let lastOutput: string | null = null;
 
 let statusBar: vscode.StatusBarItem | null = null;
 let lastTaskLinkColumn: vscode.ViewColumn | undefined;
+let taskBlockDecorationType: vscode.TextEditorDecorationType | null = null;
+let activeTaskBlockDecorationType: vscode.TextEditorDecorationType | null = null;
+let taskMarkerDecorationType: vscode.TextEditorDecorationType | null = null;
 
 function setBusyStatus(text: string | null) {
   if (!statusBar) { return; }
@@ -1657,9 +1660,11 @@ function getFullRegionRangeIncludingMarkerLines(doc: vscode.TextDocument, r: Tas
   const startLine = doc.lineAt(startPos.line);
   const endLine = doc.lineAt(endPos.line);
 
-  // Replace from beginning of START marker line to end of END marker line (including newline if present)
+  // Replace from beginning of START marker line to end of END marker line.
+  // Do not include the trailing line break, otherwise adjacent task blocks can
+  // visually overlap on the next task's start marker line.
   const replaceStart = startLine.range.start;
-  const replaceEnd = endLine.rangeIncludingLineBreak.end;
+  const replaceEnd = endLine.range.end;
 
   // Fallback if something weird happens (e.g., both tokens on same line)
   if (doc.offsetAt(replaceStart) >= doc.offsetAt(replaceEnd)) {
@@ -1667,6 +1672,74 @@ function getFullRegionRangeIncludingMarkerLines(doc: vscode.TextDocument, r: Tas
   }
 
   return new vscode.Range(replaceStart, replaceEnd);
+}
+
+function isTaskDecoratableDocument(doc: vscode.TextDocument): boolean {
+  return doc.uri.scheme === "file" && doc.getText().includes("__LC_TASK_");
+}
+
+function getMarkerLineRanges(doc: vscode.TextDocument, region: TaskRegionHit): {
+  startLineRange: vscode.Range;
+  endLineRange: vscode.Range;
+} {
+  const startPos = doc.positionAt(region.startTokenStart);
+  const endPos = doc.positionAt(region.endTokenEnd);
+  return {
+    startLineRange: doc.lineAt(startPos.line).range,
+    endLineRange: doc.lineAt(endPos.line).range,
+  };
+}
+
+function refreshTaskDecorationsForEditor(editor: vscode.TextEditor): void {
+  if (!taskBlockDecorationType || !activeTaskBlockDecorationType || !taskMarkerDecorationType) {
+    return;
+  }
+
+  const doc = editor.document;
+  if (!isTaskDecoratableDocument(doc)) {
+    editor.setDecorations(taskBlockDecorationType, []);
+    editor.setDecorations(activeTaskBlockDecorationType, []);
+    editor.setDecorations(taskMarkerDecorationType, []);
+    return;
+  }
+
+  const text = doc.getText();
+  const regions = listTaskRegions(text);
+  if (regions.length === 0) {
+    editor.setDecorations(taskBlockDecorationType, []);
+    editor.setDecorations(activeTaskBlockDecorationType, []);
+    editor.setDecorations(taskMarkerDecorationType, []);
+    return;
+  }
+
+  const activeOffset = doc.offsetAt(editor.selection.active);
+  const activeRegion = findTaskRegionAtPosition(text, activeOffset);
+
+  const blockRanges: vscode.Range[] = [];
+  const activeBlockRanges: vscode.Range[] = [];
+  const markerRanges: vscode.Range[] = [];
+
+  for (const region of regions) {
+    const fullRange = getFullRegionRangeIncludingMarkerLines(doc, region);
+    if (activeRegion?.id === region.id && activeRegion.startTokenStart === region.startTokenStart) {
+      activeBlockRanges.push(fullRange);
+    } else {
+      blockRanges.push(fullRange);
+    }
+
+    const { startLineRange, endLineRange } = getMarkerLineRanges(doc, region);
+    markerRanges.push(startLineRange, endLineRange);
+  }
+
+  editor.setDecorations(taskBlockDecorationType, blockRanges);
+  editor.setDecorations(activeTaskBlockDecorationType, activeBlockRanges);
+  editor.setDecorations(taskMarkerDecorationType, markerRanges);
+}
+
+function refreshTaskDecorationsForVisibleEditors(): void {
+  for (const editor of vscode.window.visibleTextEditors) {
+    refreshTaskDecorationsForEditor(editor);
+  }
 }
 
 function normalizeSolutionNewlines(s: string): string {
@@ -2408,6 +2481,55 @@ export async function activate(context: vscode.ExtensionContext) {
   statusBar.hide();
   context.subscriptions.push(statusBar);
 
+  taskBlockDecorationType = vscode.window.createTextEditorDecorationType({
+    backgroundColor: new vscode.ThemeColor("editor.rangeHighlightBackground"),
+    border: "1px solid",
+    borderColor: new vscode.ThemeColor("editor.wordHighlightBorder"),
+    borderRadius: "4px",
+    overviewRulerColor: new vscode.ThemeColor("editor.wordHighlightStrongBorder"),
+    overviewRulerLane: vscode.OverviewRulerLane.Center,
+  });
+  activeTaskBlockDecorationType = vscode.window.createTextEditorDecorationType({
+    backgroundColor: new vscode.ThemeColor("editor.selectionHighlightBackground"),
+    border: "1px solid",
+    borderColor: new vscode.ThemeColor("editor.wordHighlightStrongBorder"),
+    borderRadius: "4px",
+    overviewRulerColor: new vscode.ThemeColor("editor.wordHighlightStrongBorder"),
+    overviewRulerLane: vscode.OverviewRulerLane.Center,
+  });
+  taskMarkerDecorationType = vscode.window.createTextEditorDecorationType({
+    isWholeLine: true,
+    color: new vscode.ThemeColor("editorCodeLens.foreground"),
+    backgroundColor: new vscode.ThemeColor("editor.findMatchHighlightBackground"),
+  });
+  context.subscriptions.push(
+    taskBlockDecorationType,
+    activeTaskBlockDecorationType,
+    taskMarkerDecorationType
+  );
+
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTextEditor((editor) => {
+      if (editor) {
+        refreshTaskDecorationsForEditor(editor);
+      }
+      refreshTaskDecorationsForVisibleEditors();
+    }),
+    vscode.window.onDidChangeVisibleTextEditors(() => {
+      refreshTaskDecorationsForVisibleEditors();
+    }),
+    vscode.window.onDidChangeTextEditorSelection((event) => {
+      refreshTaskDecorationsForEditor(event.textEditor);
+    }),
+    vscode.workspace.onDidChangeTextDocument((event) => {
+      for (const editor of vscode.window.visibleTextEditors) {
+        if (editor.document.uri.toString() === event.document.uri.toString()) {
+          refreshTaskDecorationsForEditor(editor);
+        }
+      }
+    })
+  );
+
   // Provide in-memory documents for diff previews (proposed/artifact content).
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider(PROPOSED_SCHEME, {
@@ -2509,6 +2631,8 @@ export async function activate(context: vscode.ExtensionContext) {
       vscode.window.showInformationMessage(`Saved: ${path.basename(uri.fsPath)}`);
     })
   );
+
+  refreshTaskDecorationsForVisibleEditors();
 
   
   // Install Copilot CLI
