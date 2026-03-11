@@ -61,7 +61,7 @@ function logDuration(
 const proposedContent = new Map<string, string>();
 const PROPOSED_SCHEME = "learning-copilot";
 const SOLUTION_SCHEME = "learning-copilot-solution";
-const EXTENSION_URI_ID = "tgifford-usc.learning-copilot";
+const EXTENSION_URI_ID = "dr-offig.learning-copilot";
 
 type WrittenFile = { rel: string; fullContent: string };
 
