@@ -1,20 +1,29 @@
 # Learning Copilot
 
-Learning Copilot is a VS Code extension that uses the GitHub Copilot CLI to:
+Learning Copilot is a VS Code extension that uses GitHub Copilot to:
 
 - generate or modify real project files from a prompt
 - automatically convert those solutions into a guided learning scaffold
 - create `LEARNING_EXERCISES.md` plus an instructor-only answer key
-- let learners reveal hints or apply solutions for individual blanks
+- let learners reveal hints or apply solutions for individual tasks
+
+It talks to Copilot through the VS Code Language Model API when the GitHub
+Copilot Chat extension is installed and signed in, and falls back to the
+GitHub Copilot CLI otherwise (the extension can install the CLI for you,
+without admin rights).
 
 ## What It Does
 
-After code generation/modification, the extension can scaffold the result by:
+After code generation/modification, the extension scaffolds the result:
 
-- masking selected logic with typed blank markers (`__LC_BLANK_<id>_START__/END__`)
-- saving solution mappings (per blank id)
-- writing learner instructions to `LEARNING_EXERCISES.md`
-- saving private artifacts (full solution snapshots + answer keys) in extension storage
+- the model nominates verbatim code snippets worth turning into exercises
+- the extension locates each snippet and inserts task markers
+  (`__LC_TASK_<id>_START__/END__`) itself, using the correct comment syntax
+  for each file type — so marker formatting can't be wrong
+- solution mappings are saved per task id
+- learner instructions are written to `LEARNING_EXERCISES.md`
+- private artifacts (full solution snapshots + answer keys) are saved in
+  extension storage
 
 It also supports:
 
@@ -25,8 +34,9 @@ It also supports:
 ## Requirements
 
 - VS Code `^1.109.0`
-- GitHub Copilot CLI access (the extension can install it for you)
-- A GitHub account with Copilot entitlement
+- A GitHub account with Copilot entitlement (the free student plan works)
+- Either the GitHub Copilot Chat extension (preferred), or GitHub Copilot CLI
+  access (the extension can install the CLI for you)
 - Open a workspace/folder before running commands
 
 ## Quick Start
@@ -55,6 +65,12 @@ When authentication is missing, the extension prompts you to log in and opens a 
 
 ## Settings
 
+- `learningCopilot.transport` (default: `auto`) — `auto` uses the VS Code
+  Language Model API when a Copilot model is available and falls back to the
+  Copilot CLI; `languageModelApi` and `copilotCli` force one transport.
+- `learningCopilot.modelFamily` (default: empty) — preferred model family for
+  the Language Model API; empty picks the Copilot model with the largest
+  context window.
 - `learningCopilot.copilotPath` (default: `copilot`)
 - `learningCopilot.autoInstallCopilotCli` (default: `true`)
 - `learningCopilot.copilotArgs` (default: `[]`)

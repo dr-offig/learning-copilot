@@ -52,6 +52,22 @@
           "items": { "type": "string" },
           "default": [],
           "description": "Extra args passed to Copilot CLI."
+        },
+        "learningCopilot.transport": {
+          "type": "string",
+          "enum": ["auto", "languageModelApi", "copilotCli"],
+          "default": "auto",
+          "enumDescriptions": [
+            "Use the VS Code Language Model API when a Copilot model is available (requires the GitHub Copilot Chat extension), otherwise fall back to the Copilot CLI.",
+            "Always use the VS Code Language Model API (requires the GitHub Copilot Chat extension, signed in).",
+            "Always use the Copilot CLI."
+          ],
+          "description": "How Learning Copilot talks to the model."
+        },
+        "learningCopilot.modelFamily": {
+          "type": "string",
+          "default": "",
+          "description": "Preferred model family for the Language Model API (e.g. 'gpt-4o'). Leave empty to pick the available Copilot model with the largest context window."
         }
       }
     }
