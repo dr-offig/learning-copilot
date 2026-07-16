@@ -68,6 +68,19 @@ export type WorkspaceFileContext = { path: string; content: string; truncated?: 
 export type LineLogger = { appendLine(line: string): void };
 
 /**
+ * A binary file (design mockup PDF or image) sent alongside a request. The
+ * CLI transport stages `data` in a scratch directory and references it with a
+ * relative @path; the Language Model API transport sends it as an image data
+ * part (images only — it cannot accept PDFs).
+ */
+export type LlmAttachment = {
+  /** Workspace-relative path; used to label the file for the model. */
+  rel: string;
+  mimeType: string;
+  data: Uint8Array;
+};
+
+/**
  * A single structured-output request to a language model. `instructions`
  * must stay short; anything large (file contents etc.) goes in `payload` so
  * transports can route it around size limits (argv caps, token budgets).
@@ -75,6 +88,8 @@ export type LineLogger = { appendLine(line: string): void };
 export type LlmJsonRequest = {
   instructions: string;
   payload?: string;
+  /** Binary files the model should look at (vision input). */
+  attachments?: LlmAttachment[];
   /** Keys that must exist on the result object; used by text-extraction fallbacks. */
   requiredKeys: string[];
   /** Tool/function name used by schema-constrained transports. */

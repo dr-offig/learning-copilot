@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { spawn } from "node:child_process";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
@@ -584,6 +585,7 @@ const IGNORED_FILE_BASENAMES = new Set([
   "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json",
   "composer.lock", "gemfile.lock", "cargo.lock", "poetry.lock", "uv.lock",
   "pipfile.lock", "learning_exercises.md", "learning_brief.md",
+  "learning_designs.md",
 ]);
 
 const MAX_ARTIFACT_IMPORT_FILES = 200;
@@ -1741,25 +1743,37 @@ const FILE_PLAN_SCHEMA = {
 const FILE_PLAN_SCHEMA_TEXT =
   '{"files":[{"path":string,"content":string,"overwrite":boolean?}],"notes":string?,"studentBriefMd":string,"studentBrief":{"overviewMd":string,"sections":[{"title":string,"summary":string,"files":string[],"visibleEffect":string?,"behavior":string?,"whyItMatters":string?}]}}';
 
-function buildGeneratePlanInstructions(userPrompt: string): string {
+function buildGeneratePlanInstructions(userPrompt: string, hasDesignAnalyses: boolean): string {
   return (
     "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
     `Schema: ${FILE_PLAN_SCHEMA_TEXT}. ` +
     "Also output BOTH studentBriefMd and studentBrief. studentBriefMd should be a concise learner-facing markdown brief that explains what was created, what the resulting interface/behavior should look like or do, and which files are important. studentBrief should contain the same information in structured form: overviewMd plus sections. Write both for a student who will read the brief while a later learning scaffold is being generated. " +
     "IMPORTANT: Do NOT inspect the workspace. Do NOT list directories. Do NOT search files. Do NOT run tools. Do NOT create temp files. Do NOT validate by writing files. Do NOT attempt to edit the workspace yourself. Return the JSON response directly from reasoning only. " +
+    (hasDesignAnalyses
+      ? "The INPUT PAYLOAD is a JSON array of design-document analyses ({path,analysisMd}) describing design files (PDF/image mockups) that exist in the workspace. When the task references one of these files by name, implement the corresponding analysis faithfully (layout, colors, typography, content). " +
+        "If the task doesn't reference any design file explicitly but clearly concerns the same subject, use the analyses as the design guide. "
+      : "") +
     "All paths must be relative to the workspace root and must not contain '..' or start with '/'. " +
     "Prefer best practice separation of concerns. " +
     "Task: " + userPrompt
   );
 }
 
-function buildModifyPlanInstructions(userPrompt: string, activeRel: string | null): string {
+function buildModifyPlanInstructions(
+  userPrompt: string,
+  activeRel: string | null,
+  hasDesignAnalyses: boolean
+): string {
   return (
     "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
     `Schema: ${FILE_PLAN_SCHEMA_TEXT}. ` +
     "Also output BOTH studentBriefMd and studentBrief. studentBriefMd should be a concise learner-facing markdown brief that explains what changed, why it changed, what the new interface/behavior should look like or do, and which files are important. studentBrief should contain the same information in structured form: overviewMd plus sections. Write both for a student who will attempt follow-up learning tasks without seeing the full solution. " +
     "IMPORTANT: Do NOT inspect the workspace. Do NOT list directories. Do NOT search files. Do NOT run tools. Do NOT create temp files. Do NOT validate by writing files. Do NOT attempt to edit the workspace yourself. Use only the INPUT PAYLOAD, and return the JSON response directly from reasoning only. " +
-    "You are modifying an EXISTING codebase. The INPUT PAYLOAD is a JSON array of the current workspace files ({path,content}). " +
+    "You are modifying an EXISTING codebase. The INPUT PAYLOAD is a JSON object whose 'workspaceFiles' property is an array of the current workspace files ({path,content})" +
+    (hasDesignAnalyses
+      ? ", and whose 'designAnalyses' property is an array of analyses ({path,analysisMd}) of binary design documents (PDF/image mockups) in the workspace. When the task references one of these design files by name, implement the corresponding analysis faithfully (layout, colors, typography, content)"
+      : "") +
+    ". " +
     "Only include files that need to be created or changed. Do not include unchanged files. " +
     "All paths must be relative to the workspace root and must not contain '..' or start with '/'. " +
     "If you need a new file, add it. If you modify a file, output its FULL new content. " +
@@ -2046,6 +2060,294 @@ async function persistScaffoldOutputs(args: {
 
 //#endregion
 
+//#region <DESIGN ASSET ANALYSIS>
+/**
+* ============================================================================
+* <DESIGN ASSET ANALYSIS>
+* ============================================================================
+* Binary design documents (PDF mockups, image wireframes) can't be included
+* in the text payload, so each one is analyzed once by a vision-capable model
+* and the resulting markdown description is cached per-workspace, keyed by
+* content hash. Later plan prompts receive the cached analyses labeled by
+* filename, so a student prompt can simply say "follow homepage.pdf".
+*/
+
+const DESIGN_ASSET_MIME_BY_EXT = new Map<string, string>([
+  [".pdf", "application/pdf"],
+  [".png", "image/png"],
+  [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"],
+  [".gif", "image/gif"],
+  [".webp", "image/webp"],
+]);
+const MAX_DESIGN_ASSETS = 12;
+const MAX_DESIGN_ASSET_BYTES = 20_000_000;
+/** The Language Model API caps image data parts at 5MB. */
+const MAX_LM_IMAGE_BYTES = 5_000_000;
+const DESIGN_CACHE_KEY = "learningCopilot.designAnalyses";
+const DESIGN_NOTES_FILENAME = "LEARNING_DESIGNS.md";
+
+type DesignAnalysisRecord = { hash: string; analyzedAt: string; analysisMd: string };
+type DesignAnalysis = { path: string; analysisMd: string };
+type DesignAsset = { rel: string; uri: vscode.Uri; mimeType: string };
+
+const DESIGN_ANALYSIS_SCHEMA = {
+  type: "object",
+  properties: { analysisMd: { type: "string" } },
+  required: ["analysisMd"],
+} as const;
+
+function buildDesignAnalysisInstructions(rel: string): string {
+  return (
+    "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
+    'Schema: {"analysisMd":string}. ' +
+    `You are analyzing the attached design document '${rel}' for a student programming project. ` +
+    "In analysisMd, write a markdown description complete enough that a developer could implement the design without ever seeing the original. Include: " +
+    "overall layout and grid structure; each page or layout variant under its own heading (e.g. desktop vs mobile); every visible section in order and its content; " +
+    "navigation; the color palette as approximate hex values; typography (style, relative sizes, weights); spacing and alignment; imagery and icons; " +
+    "and interactive components with their states. Transcribe important headings and labels exactly when legible. " +
+    "IMPORTANT: The design document is attached to this prompt; you may read the attached file directly. " +
+    "Do not modify anything, do not run shell commands, and do not read any file other than the attached one. Base the analysis only on the attached file."
+  );
+}
+
+function sha256Hex(data: Uint8Array): string {
+  return crypto.createHash("sha256").update(data).digest("hex");
+}
+
+/**
+* Finds analyzable design documents in the workspace (by extension), skipping
+* dot-directories and vendored folders.
+*/
+async function findDesignAssets(wsRoot: vscode.Uri): Promise<DesignAsset[]> {
+  const exclude = getWorkspaceScanExcludeGlob();
+  const uris = await vscode.workspace.findFiles("**/*", exclude, 2000);
+
+  const found: DesignAsset[] = [];
+  for (const uri of uris) {
+    if (uri.scheme !== "file") { continue; }
+    const rel = path.relative(wsRoot.fsPath, uri.fsPath).replace(/\\/g, "/");
+    if (rel.startsWith("..") || rel.split("/").some((seg) => seg.startsWith("."))) { continue; }
+    const mimeType = DESIGN_ASSET_MIME_BY_EXT.get(path.posix.extname(rel).toLowerCase());
+    if (!mimeType) { continue; }
+    let safeRel: string;
+    try {
+      safeRel = normalizeRelativePath(rel);
+    } catch {
+      continue;
+    }
+    found.push({ rel: safeRel, uri, mimeType });
+  }
+
+  found.sort((a, b) => a.rel.localeCompare(b.rel));
+  if (found.length > MAX_DESIGN_ASSETS) {
+    vscode.window.showWarningMessage(
+      `Found ${found.length} design files; only the first ${MAX_DESIGN_ASSETS} will be analyzed.`
+    );
+    found.length = MAX_DESIGN_ASSETS;
+  }
+  return found;
+}
+
+/**
+* Creates a CLI client when a modern Copilot CLI is installed, regardless of
+* the configured transport. Used to analyze PDFs when the primary transport
+* is the Language Model API (which only accepts images).
+*/
+async function tryCreateCopilotCliClient(
+  storageDir: string,
+  output: vscode.OutputChannel
+): Promise<CopilotCliClient | null> {
+  const status = await getInstalledCopilotStatus();
+  if (status.kind !== "modern") { return null; }
+  const { copilotArgs } = getConfig();
+  return new CopilotCliClient({
+    copilotPath: status.path,
+    baseArgs: copilotArgs,
+    defaultCwd: storageDir,
+    scratchRoot: path.join(storageDir, "prompt-payloads"),
+    logDir: getCopilotLogDir(storageDir),
+    output,
+  });
+}
+
+/**
+* Writes the student-visible record of all cached design analyses.
+*/
+async function writeDesignNotesFile(
+  wsRoot: vscode.Uri,
+  analyses: DesignAnalysis[],
+  cache: Record<string, DesignAnalysisRecord>
+): Promise<vscode.Uri> {
+  const lines: string[] = [
+    "# Design Notes",
+    "",
+    "Learning Copilot analyzed the design files in this workspace. Mention a file by",
+    "name in your prompt (e.g. \"build the site following homepage.pdf\") and its",
+    "analysis below will guide the generated code.",
+    "",
+  ];
+  for (const a of analyses) {
+    lines.push(`## ${a.path}`, "");
+    const analyzedAt = cache[a.path]?.analyzedAt;
+    if (analyzedAt) {
+      lines.push(`_Analyzed: ${analyzedAt}_`, "");
+    }
+    lines.push(a.analysisMd, "");
+  }
+
+  const uri = vscode.Uri.joinPath(wsRoot, DESIGN_NOTES_FILENAME);
+  await vscode.workspace.fs.writeFile(uri, Buffer.from(lines.join("\n"), "utf8"));
+  return uri;
+}
+
+/**
+* Ensures every design asset in the workspace has an up-to-date cached
+* analysis, running model calls only for new or changed files. Returns all
+* current analyses (cached + fresh) plus how many were (re)analyzed now.
+*/
+async function ensureDesignAnalyses(args: {
+  context: vscode.ExtensionContext;
+  wsRoot: vscode.Uri;
+  runtime: LlmRuntime;
+  output: vscode.OutputChannel;
+  force?: boolean;
+  report?: (message: string) => void;
+}): Promise<{ analyses: DesignAnalysis[]; analyzedCount: number }> {
+  const { context, wsRoot, runtime, output, force, report } = args;
+
+  const assets = await findDesignAssets(wsRoot);
+  const cache = {
+    ...(context.workspaceState.get<Record<string, DesignAnalysisRecord>>(DESIGN_CACHE_KEY) ?? {}),
+  };
+
+  // Drop cache entries for files that no longer exist.
+  const present = new Set(assets.map((a) => a.rel));
+  for (const rel of Object.keys(cache)) {
+    if (!present.has(rel)) { delete cache[rel]; }
+  }
+
+  if (assets.length === 0) {
+    await context.workspaceState.update(DESIGN_CACHE_KEY, cache);
+    return { analyses: [], analyzedCount: 0 };
+  }
+
+  let cliClient: LlmJsonClient | null = runtime.client.id === "copilot-cli" ? runtime.client : null;
+  let cliUnavailableWarned = false;
+  let analyzedCount = 0;
+
+  for (let i = 0; i < assets.length; i++) {
+    const asset = assets[i];
+    let bytes: Uint8Array;
+    try {
+      bytes = await vscode.workspace.fs.readFile(asset.uri);
+    } catch {
+      continue;
+    }
+    if (bytes.byteLength > MAX_DESIGN_ASSET_BYTES) {
+      vscode.window.showWarningMessage(
+        `Skipping design file over ${Math.round(MAX_DESIGN_ASSET_BYTES / 1_000_000)} MB: ${asset.rel}`
+      );
+      continue;
+    }
+
+    const hash = sha256Hex(bytes);
+    if (!force && cache[asset.rel]?.hash === hash) { continue; }
+
+    // PDFs and oversized images can only go through the CLI transport.
+    let client = runtime.client;
+    const needsCli =
+      asset.mimeType === "application/pdf" ||
+      (client.id === "vscode-lm" && bytes.byteLength > MAX_LM_IMAGE_BYTES);
+    if (needsCli && client.id !== "copilot-cli") {
+      if (!cliClient) {
+        cliClient = await tryCreateCopilotCliClient(runtime.storageDir, output);
+      }
+      if (!cliClient) {
+        if (!cliUnavailableWarned) {
+          cliUnavailableWarned = true;
+          vscode.window.showWarningMessage(
+            `Analyzing ${asset.rel} needs the Copilot CLI (the Language Model API only accepts images up to 5 MB). ` +
+            "Run 'Copilot CLI Setup' from the Learning Copilot menu, or export the PDF pages as PNG images."
+          );
+        }
+        continue;
+      }
+      client = cliClient;
+    }
+
+    report?.(`Analyzing design file ${asset.rel} (${i + 1}/${assets.length})…`);
+    output.appendLine(`[design] Analyzing ${asset.rel} via ${client.label}`);
+
+    const requestAnalysis = async (c: LlmJsonClient): Promise<string> => {
+      const raw = await c.requestJson({
+        instructions: buildDesignAnalysisInstructions(asset.rel),
+        requiredKeys: ["analysisMd"],
+        schemaName: "emit_design_analysis",
+        schema: DESIGN_ANALYSIS_SCHEMA,
+        traceLabel: `Analyze design ${asset.rel}`,
+        attachments: [{ rel: asset.rel, mimeType: asset.mimeType, data: bytes }],
+      });
+      const analysisMd = typeof (raw as any)?.analysisMd === "string" ? (raw as any).analysisMd.trim() : "";
+      if (!analysisMd) {
+        throw new Error("Model returned an empty analysis.");
+      }
+      return analysisMd;
+    };
+
+    try {
+      let analysisMd: string;
+      try {
+        analysisMd = await requestAnalysis(client);
+      } catch (err: any) {
+        // The stable Language Model API can't report ahead of time whether
+        // the model accepts image input, so a failed image request is
+        // retried once through the CLI transport when it's available.
+        if (client.id !== "vscode-lm") { throw err; }
+        if (!cliClient) {
+          cliClient = await tryCreateCopilotCliClient(runtime.storageDir, output);
+        }
+        if (!cliClient) { throw err; }
+        output.appendLine(
+          `[design] Language Model API failed for ${asset.rel} (${err?.message ?? String(err)}); retrying via Copilot CLI.`
+        );
+        analysisMd = await requestAnalysis(cliClient);
+      }
+      cache[asset.rel] = { hash, analyzedAt: new Date().toISOString(), analysisMd };
+      analyzedCount++;
+      await context.workspaceState.update(DESIGN_CACHE_KEY, cache);
+    } catch (e: any) {
+      output.appendLine(`[design] Failed to analyze ${asset.rel}: ${e?.message ?? String(e)}`);
+      vscode.window.showWarningMessage(
+        `Could not analyze design file ${asset.rel}: ${e?.message ?? String(e)}`
+      );
+    }
+  }
+
+  await context.workspaceState.update(DESIGN_CACHE_KEY, cache);
+
+  const analyses: DesignAnalysis[] = assets
+    .filter((a) => cache[a.rel])
+    .map((a) => ({ path: a.rel, analysisMd: cache[a.rel].analysisMd }));
+
+  if (analyses.length > 0) {
+    const notesUri = vscode.Uri.joinPath(wsRoot, DESIGN_NOTES_FILENAME);
+    const notesExist = await vscode.workspace.fs.stat(notesUri).then(() => true, () => false);
+    if (analyzedCount > 0 || !notesExist) {
+      try {
+        await writeDesignNotesFile(wsRoot, analyses, cache);
+        output.appendLine(`[design] Design notes written to ${DESIGN_NOTES_FILENAME}`);
+      } catch (e: any) {
+        output.appendLine(`[design] Failed to write design notes: ${e?.message ?? String(e)}`);
+      }
+    }
+  }
+
+  return { analyses, analyzedCount };
+}
+
+//#endregion
+
 //#region <MENU>
 /**
 * ============================================================================
@@ -2104,6 +2406,11 @@ async function showLearningCopilotMenu(): Promise<void> {
       label: "$(sparkle) Create or Update Project from Prompt",
       description: "Describe what to build — code and learning tasks are generated for you",
       command: "learningCopilot.generateFromPrompt",
+    },
+    {
+      label: "$(file-media) Analyze Design Files",
+      description: "Describe PDF/image mockups so prompts can reference them by filename",
+      command: "learningCopilot.analyzeDesignFiles",
     },
     { label: "Learning Tasks", kind: vscode.QuickPickItemKind.Separator },
     {
@@ -2499,6 +2806,30 @@ export async function activate(context: vscode.ExtensionContext) {
       output.show(true);
       output.appendLine(`Using transport: ${runtime.client.label}`);
 
+      // Analyze any design documents (PDF/image mockups) so the plan prompt
+      // can honor references to them by filename. Cached analyses are reused.
+      let designAnalyses: DesignAnalysis[] = [];
+      try {
+        const designResult = await vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: "Learning Copilot: Checking design files",
+            cancellable: false,
+          },
+          async (progress) =>
+            ensureDesignAnalyses({
+              context,
+              wsRoot,
+              runtime,
+              output,
+              report: (message) => progress.report({ message }),
+            })
+        );
+        designAnalyses = designResult.analyses;
+      } catch (e: any) {
+        output.appendLine(`[design] Design analysis failed: ${e?.message ?? String(e)}`);
+      }
+
       let writtenFiles: WrittenFile[] = [];
       let briefMd = "";
 
@@ -2506,7 +2837,8 @@ export async function activate(context: vscode.ExtensionContext) {
       let planError: string | null = null;
       try {
         planRaw = await runtime.client.requestJson({
-          instructions: buildGeneratePlanInstructions(userPrompt),
+          instructions: buildGeneratePlanInstructions(userPrompt, designAnalyses.length > 0),
+          payload: designAnalyses.length > 0 ? JSON.stringify(designAnalyses) : undefined,
           requiredKeys: ["files"],
           schemaName: "emit_file_plan",
           schema: FILE_PLAN_SCHEMA,
@@ -3019,12 +3351,32 @@ export async function activate(context: vscode.ExtensionContext) {
             if (!runtime) { return; }
             output.appendLine(`Using transport: ${runtime.client.label}`);
 
+            // Analyze any design documents (PDF/image mockups) so the plan
+            // prompt can honor references to them by filename. Cached
+            // analyses are reused for unchanged files.
+            let designAnalyses: DesignAnalysis[] = [];
+            try {
+              const designResult = await ensureDesignAnalyses({
+                context,
+                wsRoot,
+                runtime,
+                output,
+                report: (message) => reportActivity(progress, output, modifyStartedAt, message, message),
+              });
+              designAnalyses = designResult.analyses;
+            } catch (e: any) {
+              output.appendLine(`[design] Design analysis failed: ${e?.message ?? String(e)}`);
+            }
+
             reportActivity(progress, output, modifyStartedAt, "Step 3/5: Asking the model to plan workspace changes…", "Step 3/5: Planning changes");
             let planRaw: unknown;
             try {
               planRaw = await runtime.client.requestJson({
-                instructions: buildModifyPlanInstructions(userPrompt, activeRel),
-                payload: JSON.stringify(ctxFiles),
+                instructions: buildModifyPlanInstructions(userPrompt, activeRel, designAnalyses.length > 0),
+                payload: JSON.stringify({
+                  workspaceFiles: ctxFiles,
+                  ...(designAnalyses.length > 0 ? { designAnalyses } : {}),
+                }),
                 requiredKeys: ["files"],
                 schemaName: "emit_file_plan",
                 schema: FILE_PLAN_SCHEMA,
@@ -3219,6 +3571,82 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage(
           "No LEARNING_EXERCISES.md in this workspace yet. Use 'Learning Copilot: Create or Update Project from Prompt' to generate learning tasks first."
         );
+      }
+    })
+  );
+
+  // Analyze (or refresh) design documents on demand, outside the build flows.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("learningCopilot.analyzeDesignFiles", async () => {
+      const wsRoot = getWorkspaceRootUri();
+      if (!wsRoot) {
+        vscode.window.showErrorMessage("Open a folder/workspace first.");
+        return;
+      }
+
+      const assets = await findDesignAssets(wsRoot);
+      if (assets.length === 0) {
+        vscode.window.showInformationMessage(
+          "No design files found in this workspace (looked for PDF, PNG, JPEG, GIF, and WebP files)."
+        );
+        return;
+      }
+
+      const runtime = await resolveLlmRuntime(context, output);
+      if (!runtime) { return; }
+      output.show(true);
+      output.appendLine(`Using transport: ${runtime.client.label}`);
+
+      const runAnalysis = (force: boolean) =>
+        vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: "Learning Copilot: Analyzing design files",
+            cancellable: false,
+          },
+          async (progress) =>
+            ensureDesignAnalyses({
+              context,
+              wsRoot,
+              runtime,
+              output,
+              force,
+              report: (message) => progress.report({ message }),
+            })
+        );
+
+      let result = await runAnalysis(false);
+      if (result.analyzedCount === 0 && result.analyses.length > 0) {
+        const choice = await vscode.window.showInformationMessage(
+          `All ${result.analyses.length} design file(s) already have up-to-date analyses.`,
+          "Re-analyze All",
+          "Open Design Notes"
+        );
+        if (choice === "Re-analyze All") {
+          result = await runAnalysis(true);
+        } else if (choice !== "Open Design Notes") {
+          return;
+        }
+      }
+
+      if (result.analyses.length === 0) {
+        vscode.window.showWarningMessage("No design files could be analyzed.");
+        return;
+      }
+
+      if (result.analyzedCount > 0) {
+        vscode.window.showInformationMessage(
+          `Analyzed ${result.analyzedCount} design file(s). Prompts can now reference them by filename.`
+        );
+      }
+
+      try {
+        const doc = await vscode.workspace.openTextDocument(
+          vscode.Uri.joinPath(wsRoot, DESIGN_NOTES_FILENAME)
+        );
+        await vscode.window.showTextDocument(doc, { preview: false });
+      } catch {
+        // Notes file is missing only if every analysis failed; warnings were already shown.
       }
     })
   );

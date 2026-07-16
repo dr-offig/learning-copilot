@@ -70,33 +70,58 @@ export class CopilotCliClient implements LlmJsonClient {
   }
 
   private async runPrompt(req: LlmJsonRequest): Promise<string> {
+    const attachments = req.attachments ?? [];
     const inlinePrompt = req.payload
       ? `${req.instructions}\n\nINPUT PAYLOAD:\n${req.payload}`
       : req.instructions;
 
-    if (inlinePrompt.length <= CLI_PROMPT_CHAR_LIMIT) {
+    if (attachments.length === 0 && inlinePrompt.length <= CLI_PROMPT_CHAR_LIMIT) {
       return await this.spawnCopilot(this.ensureSilentArgs(), inlinePrompt, this.opts.defaultCwd, req.traceLabel);
     }
 
-    // Payload-file mode: the CLI reads files in its cwd without needing tool
-    // approval, so large payloads are handed over on disk instead of argv.
-    const filePrompt =
-      `${req.instructions}\n\n` +
-      "The INPUT PAYLOAD is too large to include here. Read the file ./payload.json in the current working directory and treat its entire contents as the INPUT PAYLOAD. " +
-      "Do not modify any files, do not run shell commands, and do not read anything other than ./payload.json.";
-    if (filePrompt.length > CLI_PROMPT_CHAR_LIMIT) {
-      throw new Error(`Prompt instructions are too long for the Copilot CLI on this platform (${filePrompt.length} chars).`);
-    }
-
+    // Scratch-dir mode. Attachments are staged with space-free filenames and
+    // referenced with relative @paths — the CLI rejects @paths containing
+    // spaces (quoted or escaped), but resolves relative ones against its cwd
+    // even when the cwd itself contains spaces. Payloads too large for argv
+    // are delivered via ./payload.json, which the CLI reads without needing
+    // tool approval.
     const scratchDir = path.join(this.opts.scratchRoot, `payload-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
     await fsp.mkdir(scratchDir, { recursive: true });
     try {
-      await fsp.writeFile(path.join(scratchDir, "payload.json"), req.payload ?? "", "utf8");
-      this.opts.output.appendLine(
-        `[transport] Prompt payload (${(req.payload ?? "").length} chars) exceeds argv limit; delivering via ${scratchDir}/payload.json`
-      );
       const args = [...this.ensureSilentArgs(), "--deny-tool=write", "--deny-tool=shell"];
-      return await this.spawnCopilot(args, filePrompt, scratchDir, req.traceLabel);
+      let prompt = req.instructions;
+
+      if (attachments.length > 0) {
+        const refs: string[] = [];
+        for (let i = 0; i < attachments.length; i++) {
+          const a = attachments[i];
+          const ext = path.posix.extname(a.rel).toLowerCase() || ".bin";
+          const name = `attachment-${i + 1}${ext}`;
+          await fsp.writeFile(path.join(scratchDir, name), a.data);
+          refs.push(`@${name} is the file '${a.rel}'`);
+        }
+        prompt += `\n\nAttached files:\n${refs.join("\n")}`;
+      }
+
+      if (req.payload) {
+        const withInlinePayload = `${prompt}\n\nINPUT PAYLOAD:\n${req.payload}`;
+        if (withInlinePayload.length <= CLI_PROMPT_CHAR_LIMIT) {
+          prompt = withInlinePayload;
+        } else {
+          this.opts.output.appendLine(
+            `[transport] Prompt payload (${req.payload.length} chars) exceeds argv limit; delivering via ${scratchDir}/payload.json`
+          );
+          await fsp.writeFile(path.join(scratchDir, "payload.json"), req.payload, "utf8");
+          prompt +=
+            "\n\nThe INPUT PAYLOAD is too large to include here. Read the file ./payload.json in the current working directory and treat its entire contents as the INPUT PAYLOAD. " +
+            "Do not modify any files, do not run shell commands, and do not read anything other than ./payload.json.";
+        }
+      }
+
+      if (prompt.length > CLI_PROMPT_CHAR_LIMIT) {
+        throw new Error(`Prompt instructions are too long for the Copilot CLI on this platform (${prompt.length} chars).`);
+      }
+      return await this.spawnCopilot(args, prompt, scratchDir, req.traceLabel);
     } finally {
       fsp.rm(scratchDir, { recursive: true, force: true }).catch(() => { /* best effort */ });
     }
@@ -182,7 +207,16 @@ export class VscodeLmClient implements LlmJsonClient {
   }
 
   async requestJson(req: LlmJsonRequest): Promise<unknown> {
+    const model = this.pickModelFor(req);
     const messages = [vscode.LanguageModelChatMessage.User(req.instructions)];
+    for (const a of req.attachments ?? []) {
+      messages.push(
+        vscode.LanguageModelChatMessage.User([
+          new vscode.LanguageModelTextPart(`Attached file: ${a.rel}`),
+          vscode.LanguageModelDataPart.image(a.data, a.mimeType),
+        ])
+      );
+    }
     if (req.payload) {
       messages.push(vscode.LanguageModelChatMessage.User(`INPUT PAYLOAD:\n${req.payload}`));
     }
@@ -191,7 +225,7 @@ export class VscodeLmClient implements LlmJsonClient {
 
     // Preferred: force a tool call so the response is schema-constrained.
     try {
-      const result = await this.sendConstrained(messages, req, justification);
+      const result = await this.sendConstrained(model, messages, req, justification);
       if (result !== undefined) {
         return result;
       }
@@ -202,18 +236,37 @@ export class VscodeLmClient implements LlmJsonClient {
       );
     }
 
-    const text = await this.sendPlain(messages, req, justification);
+    const text = await this.sendPlain(model, messages, req, justification);
     const raw = extractLikelyJsonObject(text, req.requiredKeys);
     return JSON.parse(raw);
   }
 
+  /**
+   * Validates attachments and returns the model for this request. PDFs are
+   * rejected outright: the Language Model API only accepts image data parts,
+   * so callers must route PDF attachments through the CLI transport. Whether
+   * the model accepts image input is not knowable ahead of time (the stable
+   * API exposes capabilities only on the provider side), so image rejections
+   * surface as request errors that callers can retry via the CLI transport.
+   */
+  private pickModelFor(req: LlmJsonRequest): vscode.LanguageModelChat {
+    const pdf = (req.attachments ?? []).find((a) => a.mimeType === "application/pdf");
+    if (pdf) {
+      throw new Error(
+        `The VS Code Language Model API cannot accept PDF attachments ('${pdf.rel}'). Use the Copilot CLI for PDF analysis.`
+      );
+    }
+    return this.model;
+  }
+
   private async sendConstrained(
+    model: vscode.LanguageModelChat,
     messages: vscode.LanguageModelChatMessage[],
     req: LlmJsonRequest,
     justification: string
   ): Promise<unknown | undefined> {
     const startedAt = Date.now();
-    const response = await this.model.sendRequest(messages, {
+    const response = await model.sendRequest(messages, {
       justification,
       tools: [
         {
@@ -248,12 +301,13 @@ export class VscodeLmClient implements LlmJsonClient {
   }
 
   private async sendPlain(
+    model: vscode.LanguageModelChat,
     messages: vscode.LanguageModelChatMessage[],
     req: LlmJsonRequest,
     justification: string
   ): Promise<string> {
     const startedAt = Date.now();
-    const response = await this.model.sendRequest(messages, { justification });
+    const response = await model.sendRequest(messages, { justification });
     let text = "";
     for await (const chunk of response.text) {
       text += chunk;

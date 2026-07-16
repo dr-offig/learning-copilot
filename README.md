@@ -31,6 +31,24 @@ It also supports:
 - revealing/applied blank solutions at cursor or next blank
 - marking blanks done while keeping your own implementation
 
+## Design Files (PDFs and Images)
+
+Drop design documents (PDF mockups, PNG/JPEG/GIF/WebP wireframes) into the
+workspace and Learning Copilot analyzes them with a vision-capable model:
+
+- Each file is analyzed once and the description cached (keyed by content
+  hash), so unchanged files are never re-analyzed.
+- Analyses are written to `LEARNING_DESIGNS.md` so students can read what the
+  model saw.
+- Prompts can then reference a design by filename, e.g. *"build the site
+  following homepage.pdf"* — the cached analysis is supplied to the model
+  automatically during Create or Update Project from Prompt.
+- Run `Learning Copilot: Analyze Design Files` to analyze up front or refresh
+  after editing a design.
+
+PDF analysis uses the Copilot CLI (the VS Code Language Model API only
+accepts images); images work on either transport.
+
 ## Requirements
 
 - VS Code `^1.109.0`
@@ -63,6 +81,7 @@ in the Command Palette:
 
 - `Learning Copilot: Open Menu`
 - `Learning Copilot: Create or Update Project from Prompt`
+- `Learning Copilot: Analyze Design Files`
 - `Learning Copilot: Open Learning Exercises`
 - `Learning Copilot: Compare Active File With Solution`
 - `Learning Copilot: Apply Solution For Task At Cursor`
