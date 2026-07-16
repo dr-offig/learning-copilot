@@ -14,17 +14,13 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": ["onStartupFinished"],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
-      { "command": "learningCopilot.saveLastOutput", "title": "Learning Copilot: Save Last Output" },
-      { "command": "learningCopilot.installCopilotCli", "title": "Learning Copilot: Install/Setup Copilot CLI" },
-      { "command": "learningCopilot.loginCopilotCli", "title": "Learning Copilot: Login to Copilot CLI" },
-      { "command": "learningCopilot.logoutCopilotCli", "title": "Learning Copilot: Logout of Copilot CLI" },
-      { "command": "learningCopilot.showCopilotCliDetails", "title": "Learning Copilot: Show Copilot CLI Details" },
-      { "command": "learningCopilot.setCopilotCliPath", "title": "Learning Copilot: Set Copilot CLI Path" },
-      { "command": "learningCopilot.generateCodeFilesPrompt", "title": "Learning Copilot: Generate Code Files from Prompt" },
+      { "command": "learningCopilot.showMenu", "title": "Learning Copilot: Open Menu", "icon": "$(mortar-board)" },
+      { "command": "learningCopilot.generateFromPrompt", "title": "Learning Copilot: Create or Update Project from Prompt" },
+      { "command": "learningCopilot.openExercises", "title": "Learning Copilot: Open Learning Exercises" },
       { "command": "learningCopilot.compareWithSolution", "title": "Learning Copilot: Compare Active File With Solution"},
       { "command": "learningCopilot.applyTaskAtCursor", "title": "Learning Copilot: Apply Solution For Task At Cursor" },
       { "command": "learningCopilot.applyNextTask", "title": "Learning Copilot: Apply Solution For Next Task" },
@@ -32,8 +28,19 @@
       { "command": "learningCopilot.showHintForTaskAtCursor", "title": "Learning Copilot: Show Hint For Task At Cursor" },
       { "command": "learningCopilot.markTaskDoneAtCursor", "title": "Learning Copilot: Mark Task As Done At Cursor" },
       { "command": "learningCopilot.openLatestAnswerKey", "title": "Learning Copilot: Open Latest Answer Key" },
-      { "command": "learningCopilot.modifyWorkspaceFromPrompt", "title": "Learning Copilot: Modify Workspace From Prompt" }
+      { "command": "learningCopilot.installCopilotCli", "title": "Learning Copilot: Install/Setup Copilot CLI" },
+      { "command": "learningCopilot.loginCopilotCli", "title": "Learning Copilot: Login to Copilot CLI" },
+      { "command": "learningCopilot.logoutCopilotCli", "title": "Learning Copilot: Logout of Copilot CLI" },
+      { "command": "learningCopilot.showCopilotCliDetails", "title": "Learning Copilot: Show Copilot CLI Details" },
+      { "command": "learningCopilot.setCopilotCliPath", "title": "Learning Copilot: Set Copilot CLI Path" }
     ],
+    "menus": {
+      "editor/context": [
+        { "command": "learningCopilot.showHintForTaskAtCursor", "when": "learningCopilot.taskAtCursor", "group": "learningCopilot@1" },
+        { "command": "learningCopilot.markTaskDoneAtCursor", "when": "learningCopilot.taskAtCursor", "group": "learningCopilot@2" },
+        { "command": "learningCopilot.applyTaskAtCursor", "when": "learningCopilot.taskAtCursor", "group": "learningCopilot@3" }
+      ]
+    },
     "configuration": {
       "title": "Learning Copilot",
       "properties": {

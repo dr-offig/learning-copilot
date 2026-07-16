@@ -28,9 +28,8 @@ import type {
   WrittenFile,
 } from "./types";
 
-let lastOutput: string | null = null;
-
 let statusBar: vscode.StatusBarItem | null = null;
+let menuStatusBar: vscode.StatusBarItem | null = null;
 let lastTaskLinkColumn: vscode.ViewColumn | undefined;
 let taskBlockDecorationType: vscode.TextEditorDecorationType | null = null;
 let activeTaskBlockDecorationType: vscode.TextEditorDecorationType | null = null;
@@ -875,33 +874,6 @@ async function ensureDirForFile(uri: vscode.Uri): Promise<void> {
 
 
 /**
-* Chooses where to save generated markdown output.
-*
-* @param context VS Code extension context.
-*/
-async function pickSaveUri(context: vscode.ExtensionContext): Promise<vscode.Uri> {
-  const ws = vscode.workspace.workspaceFolders?.[0];
-  if (ws) {
-    // Try workspace root first (if it’s writable in the environment)
-    const defaultName = "exercise.md";
-    const wsUri = vscode.Uri.joinPath(ws.uri, defaultName);
-
-    // We can’t reliably pre-test writability across all FS providers,
-    // so we offer Save Dialog with workspace default.
-    const picked = await vscode.window.showSaveDialog({
-      defaultUri: wsUri,
-      filters: { Markdown: ["md"] },
-      saveLabel: "Save exercise",
-    });
-    if (picked) { return picked; }
-  }
-
-  // Fallback to extension storage (always writable in user profile)
-  await vscode.workspace.fs.createDirectory(context.globalStorageUri);
-  return vscode.Uri.joinPath(context.globalStorageUri, "exercise.md");
-}
-
-/**
 * Returns a conservative exclude glob for scanning a workspace.
 */
 function getWorkspaceScanExcludeGlob(): string {
@@ -918,6 +890,46 @@ function looksLikeText(buf: Uint8Array): boolean {
     if (buf[i] === 0) {return false;}
   }
   return true;
+}
+
+/**
+ * Files that don't count as "existing project code" when deciding whether a
+ * prompt should create a fresh project or modify the current one.
+ */
+const NON_PROJECT_BASENAMES = new Set([
+  "readme", "readme.md", "readme.txt", "license", "license.md", "license.txt",
+  "notice", "notice.md", "changelog", "changelog.md", "authors", "authors.md",
+  "contributing.md", "code_of_conduct.md",
+]);
+
+const NON_PROJECT_EXTENSIONS = new Set([
+  ".md", ".txt", ".rtf", ".pdf", ".doc", ".docx",
+  ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
+  ".mp3", ".mp4", ".mov", ".wav", ".zip", ".gz",
+]);
+
+type PromptWorkflowMode = "create" | "modify";
+
+/**
+* Decides whether a student's prompt should create a fresh project or modify
+* existing code, by checking whether the workspace already contains code
+* files. Docs, licenses, dotfiles, media, and Learning Copilot's own outputs
+* don't count as existing code.
+*/
+async function detectPromptWorkflowMode(wsRoot: vscode.Uri): Promise<PromptWorkflowMode> {
+  const exclude = getWorkspaceScanExcludeGlob();
+  const uris = await vscode.workspace.findFiles("**/*", exclude, 500);
+
+  for (const uri of uris) {
+    if (uri.scheme !== "file") { continue; }
+    const rel = path.relative(wsRoot.fsPath, uri.fsPath).replace(/\\/g, "/");
+    if (rel.startsWith("..") || rel.split("/").some((seg) => seg.startsWith("."))) { continue; }
+    const base = path.posix.basename(rel).toLowerCase();
+    if (NON_PROJECT_BASENAMES.has(base) || IGNORED_FILE_BASENAMES.has(base)) { continue; }
+    if (NON_PROJECT_EXTENSIONS.has(path.posix.extname(base))) { continue; }
+    return "modify";
+  }
+  return "create";
 }
 
 type TaskJumpLink = {
@@ -1267,6 +1279,19 @@ function getMarkerLineRanges(doc: vscode.TextDocument, region: TaskRegionHit): {
   };
 }
 
+let taskAtCursorContext: boolean | null = null;
+
+/**
+* Drives the 'learningCopilot.taskAtCursor' when-clause context used by the
+* editor context menu contributions in package.json.
+*/
+function setTaskAtCursorContext(editor: vscode.TextEditor, value: boolean): void {
+  if (editor !== vscode.window.activeTextEditor) { return; }
+  if (taskAtCursorContext === value) { return; }
+  taskAtCursorContext = value;
+  void vscode.commands.executeCommand("setContext", "learningCopilot.taskAtCursor", value);
+}
+
 function refreshTaskDecorationsForEditor(editor: vscode.TextEditor): void {
   if (!taskBlockDecorationType || !activeTaskBlockDecorationType || !taskMarkerDecorationType) {
     return;
@@ -1277,6 +1302,7 @@ function refreshTaskDecorationsForEditor(editor: vscode.TextEditor): void {
     editor.setDecorations(taskBlockDecorationType, []);
     editor.setDecorations(activeTaskBlockDecorationType, []);
     editor.setDecorations(taskMarkerDecorationType, []);
+    setTaskAtCursorContext(editor, false);
     return;
   }
 
@@ -1286,11 +1312,13 @@ function refreshTaskDecorationsForEditor(editor: vscode.TextEditor): void {
     editor.setDecorations(taskBlockDecorationType, []);
     editor.setDecorations(activeTaskBlockDecorationType, []);
     editor.setDecorations(taskMarkerDecorationType, []);
+    setTaskAtCursorContext(editor, false);
     return;
   }
 
   const activeOffset = doc.offsetAt(editor.selection.active);
   const activeRegion = findTaskRegionAtPosition(text, activeOffset);
+  setTaskAtCursorContext(editor, !!activeRegion);
 
   const blockRanges: vscode.Range[] = [];
   const activeBlockRanges: vscode.Range[] = [];
@@ -2018,6 +2046,127 @@ async function persistScaffoldOutputs(args: {
 
 //#endregion
 
+//#region <MENU>
+/**
+* ============================================================================
+* <MENU>
+* ============================================================================
+* The status-bar entry point: a QuickPick menu listing everything the
+* extension can do, so students don't have to hunt through the command
+* palette.
+*/
+
+type LearningCopilotMenuItem = vscode.QuickPickItem & {
+  command?: string;
+  submenu?: "copilotCliSetup";
+};
+
+async function showCopilotCliSetupMenu(): Promise<void> {
+  const items: LearningCopilotMenuItem[] = [
+    {
+      label: "$(info) Show Copilot CLI Details",
+      description: "Where the CLI is installed and whether you are logged in",
+      command: "learningCopilot.showCopilotCliDetails",
+    },
+    {
+      label: "$(cloud-download) Install/Setup Copilot CLI",
+      description: "Installs into extension storage; no admin rights needed",
+      command: "learningCopilot.installCopilotCli",
+    },
+    {
+      label: "$(sign-in) Login to Copilot CLI",
+      command: "learningCopilot.loginCopilotCli",
+    },
+    {
+      label: "$(sign-out) Logout of Copilot CLI",
+      command: "learningCopilot.logoutCopilotCli",
+    },
+    {
+      label: "$(file-symlink-file) Set Copilot CLI Path",
+      description: "Point at an existing copilot executable",
+      command: "learningCopilot.setCopilotCliPath",
+    },
+  ];
+
+  const pick = await vscode.window.showQuickPick(items, {
+    title: "Learning Copilot: Copilot CLI Setup (only needed when the GitHub Copilot Chat extension is unavailable)",
+    placeHolder: "Select a setup action below",
+  });
+  if (pick?.command) {
+    await vscode.commands.executeCommand(pick.command);
+  }
+}
+
+async function showLearningCopilotMenu(): Promise<void> {
+  const items: LearningCopilotMenuItem[] = [
+    { label: "Build", kind: vscode.QuickPickItemKind.Separator },
+    {
+      label: "$(sparkle) Create or Update Project from Prompt",
+      description: "Describe what to build — code and learning tasks are generated for you",
+      command: "learningCopilot.generateFromPrompt",
+    },
+    { label: "Learning Tasks", kind: vscode.QuickPickItemKind.Separator },
+    {
+      label: "$(book) Open Learning Exercises",
+      description: "Open LEARNING_EXERCISES.md with links to each task",
+      command: "learningCopilot.openExercises",
+    },
+    {
+      label: "$(lightbulb) Show Hint for Task at Cursor",
+      command: "learningCopilot.showHintForTaskAtCursor",
+    },
+    {
+      label: "$(pass) Mark Task at Cursor as Done",
+      description: "Keeps your code and removes the task markers",
+      command: "learningCopilot.markTaskDoneAtCursor",
+    },
+    {
+      label: "$(wand) Apply Solution for Task at Cursor",
+      command: "learningCopilot.applyTaskAtCursor",
+    },
+    {
+      label: "$(arrow-down) Apply Solution for Next Task",
+      command: "learningCopilot.applyNextTask",
+    },
+    {
+      label: "$(checklist) Apply Solutions for All Tasks",
+      command: "learningCopilot.applyAllTasks",
+    },
+    {
+      label: "$(diff) Compare Active File with Solution",
+      command: "learningCopilot.compareWithSolution",
+    },
+    { label: "Instructor", kind: vscode.QuickPickItemKind.Separator },
+    {
+      label: "$(key) Open Latest Answer Key",
+      command: "learningCopilot.openLatestAnswerKey",
+    },
+    { label: "Setup", kind: vscode.QuickPickItemKind.Separator },
+    {
+      label: "$(tools) Copilot CLI Setup…",
+      description: "Install, login, or configure the Copilot CLI fallback",
+      submenu: "copilotCliSetup",
+    },
+  ];
+
+  const pick = await vscode.window.showQuickPick(items, {
+    title: "Learning Copilot",
+    placeHolder: "Select an action below (or type to filter the list)",
+    matchOnDescription: true,
+  });
+  if (!pick) { return; }
+
+  if (pick.submenu === "copilotCliSetup") {
+    await showCopilotCliSetupMenu();
+    return;
+  }
+  if (pick.command) {
+    await vscode.commands.executeCommand(pick.command);
+  }
+}
+
+//#endregion
+
 //#region <EXTENSION LIFECYCLE AND COMMANDS>
 /**
 * ============================================================================
@@ -2035,6 +2184,15 @@ export async function activate(context: vscode.ExtensionContext) {
   const output = vscode.window.createOutputChannel("Learning Copilot");
   context.subscriptions.push(output);
 
+  // Always-visible entry point: opens the Learning Copilot menu.
+  menuStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 101);
+  menuStatusBar.command = "learningCopilot.showMenu";
+  menuStatusBar.text = "$(mortar-board) Learning Copilot";
+  menuStatusBar.tooltip = "Open the Learning Copilot menu";
+  menuStatusBar.show();
+  context.subscriptions.push(menuStatusBar);
+
+  // Busy indicator: only shown while a workflow is running.
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   statusBar.command = "workbench.action.output.toggleOutput";
   statusBar.text = "$(check) Learning Copilot";
@@ -2170,26 +2328,6 @@ export async function activate(context: vscode.ExtensionContext) {
       } catch (err: any) {
         vscode.window.showErrorMessage(`Failed to open task location: ${err?.message ?? String(err)}`);
       }
-    })
-  );
-
-  // Save Last Output
-  context.subscriptions.push(
-    vscode.commands.registerCommand("learningCopilot.saveLastOutput", async () => {
-      if (!lastOutput) {
-        vscode.window.showWarningMessage("No output to save yet. Generate an exercise first.");
-        return;
-      }
-
-      const uri = await pickSaveUri(context);
-      const bytes = Buffer.from(lastOutput + "\n", "utf8");
-      await vscode.workspace.fs.writeFile(uri, bytes);
-
-      // Open the saved file
-      const doc = await vscode.workspace.openTextDocument(uri);
-      await vscode.window.showTextDocument(doc);
-
-      vscode.window.showInformationMessage(`Saved: ${path.basename(uri.fsPath)}`);
     })
   );
 
@@ -2353,21 +2491,8 @@ export async function activate(context: vscode.ExtensionContext) {
   );
 
 
-  // Generate Code Files from Prompt
-  context.subscriptions.push(
-    vscode.commands.registerCommand("learningCopilot.generateCodeFilesPrompt", async () => {
-      const wsRoot = getWorkspaceRootUri();
-      if (!wsRoot) {
-        vscode.window.showErrorMessage("Open a folder/workspace first.");
-        return;
-      }
-
-      const userPrompt = await vscode.window.showInputBox({
-        title: "Learning Copilot: Generate code files",
-        placeHolder: "e.g., Create a simple web app with a button and slider using vanilla HTML/CSS/JS.",
-      });
-      if (!userPrompt) { return; }
-
+  // Fresh-project workflow: generate files from a prompt, then offer a scaffold.
+  async function runCreateProjectWorkflow(wsRoot: vscode.Uri, userPrompt: string): Promise<void> {
       const runtime = await resolveLlmRuntime(context, output);
       if (!runtime) { return; }
 
@@ -2514,8 +2639,7 @@ export async function activate(context: vscode.ExtensionContext) {
       }
 
       vscode.window.showInformationMessage("Learning Copilot: Scaffold generation complete.");
-    })
-  );
+  }
 
   // Compare active file with latest saved solution snapshot
   context.subscriptions.push(
@@ -2529,7 +2653,7 @@ export async function activate(context: vscode.ExtensionContext) {
       const snapshotDir = context.globalState.get<string>("learningCopilot.lastSnapshotDir");
       if (!snapshotDir) {
         vscode.window.showWarningMessage(
-          "No solution snapshot available yet. Run ‘Learning Copilot: Generate Code Files from Prompt’ and generate learning tasks first."
+          "No solution snapshot available yet. Run ‘Learning Copilot: Create or Update Project from Prompt’ and generate learning tasks first."
         );
         return;
       }
@@ -2829,21 +2953,9 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Modify / extend existing workspace from prompt (uses workspace context)
-  context.subscriptions.push(
-    vscode.commands.registerCommand("learningCopilot.modifyWorkspaceFromPrompt", async () => {
-      const wsRoot = getWorkspaceRootUri();
-      if (!wsRoot) {
-        vscode.window.showErrorMessage("Open a folder/workspace first.");
-        return;
-      }
-
-      const userPrompt = await vscode.window.showInputBox({
-        title: "Learning Copilot: Modify workspace",
-        placeHolder: "e.g., Add a dark mode toggle; add form validation; refactor into modules; add an API route; etc.",
-      });
-      if (!userPrompt) {return;}
-
+  // Existing-project workflow: modify the workspace from a prompt (using
+  // workspace context), then offer a scaffold focused on the changed files.
+  async function runModifyWorkspaceWorkflow(wsRoot: vscode.Uri, userPrompt: string): Promise<void> {
       output.show(true);
       await vscode.window.withProgress(
         {
@@ -3040,10 +3152,76 @@ export async function activate(context: vscode.ExtensionContext) {
           }
         }
       );
+  }
+
+  // Single entry point for both workflows: looks at the workspace to decide
+  // whether the student is starting fresh or updating existing code.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("learningCopilot.generateFromPrompt", async () => {
+      const wsRoot = getWorkspaceRootUri();
+      if (!wsRoot) {
+        vscode.window.showErrorMessage("Open a folder/workspace first.");
+        return;
+      }
+
+      const mode = await detectPromptWorkflowMode(wsRoot);
+      const userPrompt = await vscode.window.showInputBox(
+        mode === "create"
+        ? {
+          title: "Learning Copilot: Describe what to build",
+          prompt: "Your workspace has no code yet, so Learning Copilot will create a new project.",
+          placeHolder: "e.g., Create a simple web app with a button and slider using vanilla HTML/CSS/JS.",
+        }
+        : {
+          title: "Learning Copilot: Describe what to change or add",
+          prompt: "Learning Copilot found existing code, so it will update this project.",
+          placeHolder: "e.g., Add a dark mode toggle; add form validation; refactor into modules.",
+        }
+      );
+      if (!userPrompt) { return; }
+
+      if (mode === "create") {
+        await runCreateProjectWorkflow(wsRoot, userPrompt);
+      } else {
+        await runModifyWorkspaceWorkflow(wsRoot, userPrompt);
+      }
     })
   );
 
+  // Back-compat aliases for the two commands the unified prompt replaced.
+  for (const legacyCommand of [
+    "learningCopilot.generateCodeFilesPrompt",
+    "learningCopilot.modifyWorkspaceFromPrompt",
+  ]) {
+    context.subscriptions.push(
+      vscode.commands.registerCommand(legacyCommand, () =>
+        vscode.commands.executeCommand("learningCopilot.generateFromPrompt")
+      )
+    );
+  }
 
+  context.subscriptions.push(
+    vscode.commands.registerCommand("learningCopilot.showMenu", showLearningCopilotMenu)
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("learningCopilot.openExercises", async () => {
+      const wsRoot = getWorkspaceRootUri();
+      if (!wsRoot) {
+        vscode.window.showErrorMessage("Open a folder/workspace first.");
+        return;
+      }
+      const target = vscode.Uri.joinPath(wsRoot, "LEARNING_EXERCISES.md");
+      try {
+        const doc = await vscode.workspace.openTextDocument(target);
+        await vscode.window.showTextDocument(doc, { preview: false });
+      } catch {
+        vscode.window.showWarningMessage(
+          "No LEARNING_EXERCISES.md in this workspace yet. Use 'Learning Copilot: Create or Update Project from Prompt' to generate learning tasks first."
+        );
+      }
+    })
+  );
 }
 /**
 * Deactivates the extension.

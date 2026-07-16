@@ -42,26 +42,36 @@ It also supports:
 ## Quick Start
 
 1. Open a project folder in VS Code.
-2. Run `Learning Copilot: Install/Setup Copilot CLI`.
-3. Run `Learning Copilot: Generate Code Files from Prompt` (new project) or `Learning Copilot: Modify Workspace From Prompt` (existing project).
+2. Click the `Learning Copilot` button in the status bar (bottom left) to open the menu.
+3. Choose `Create or Update Project from Prompt` and describe what to build.
+   The extension detects whether your workspace is empty (create a new
+   project) or already contains code (update the existing project).
 4. Preview and approve file writes.
 5. Choose `Generate` when prompted to build the learning scaffold.
-6. Work through blanks and exercises, then use blank commands as needed.
+6. Work through the tasks in `LEARNING_EXERCISES.md`. Right-click inside a
+   task region for hints, marking done, or revealing the solution.
 
-When authentication is missing, the extension prompts you to log in and opens a terminal flow for Copilot CLI login.
+If the GitHub Copilot Chat extension is not available, use the menu's
+`Copilot CLI Setup…` entry to install and log in to the Copilot CLI. When
+authentication is missing, the extension prompts you to log in and opens a
+terminal flow for Copilot CLI login.
 
 ## Commands
 
-- `Learning Copilot: Install/Setup Copilot CLI`
-- `Learning Copilot: Generate Code Files from Prompt`
-- `Learning Copilot: Modify Workspace From Prompt`
+Everything is reachable from the status bar menu; the same commands are also
+in the Command Palette:
+
+- `Learning Copilot: Open Menu`
+- `Learning Copilot: Create or Update Project from Prompt`
+- `Learning Copilot: Open Learning Exercises`
 - `Learning Copilot: Compare Active File With Solution`
-- `Learning Copilot: Apply Solution For Blank At Cursor`
-- `Learning Copilot: Apply Solution For Next Blank`
-- `Learning Copilot: Show Hint For Blank At Cursor`
-- `Learning Copilot: Mark Blank As Done At Cursor`
+- `Learning Copilot: Apply Solution For Task At Cursor`
+- `Learning Copilot: Apply Solution For Next Task`
+- `Learning Copilot: Apply Solution For All Tasks`
+- `Learning Copilot: Show Hint For Task At Cursor`
+- `Learning Copilot: Mark Task As Done At Cursor`
 - `Learning Copilot: Open Latest Answer Key`
-- `Learning Copilot: Save Last Output`
+- `Learning Copilot: Install/Setup Copilot CLI` (and login/logout/details/set path)
 
 ## Settings
 
