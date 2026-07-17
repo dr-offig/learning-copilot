@@ -11,6 +11,11 @@
   "engines": {
     "vscode": "^1.109.0"
   },
+  "icon": "images/icon.png",
+  "galleryBanner": {
+    "color": "#1E293B",
+    "theme": "dark"
+  },
   "categories": [
     "Other"
   ],
@@ -34,6 +39,15 @@
       { "command": "learningCopilot.logoutCopilotCli", "title": "Learning Copilot: Logout of Copilot CLI" },
       { "command": "learningCopilot.showCopilotCliDetails", "title": "Learning Copilot: Show Copilot CLI Details" },
       { "command": "learningCopilot.setCopilotCliPath", "title": "Learning Copilot: Set Copilot CLI Path" }
+    ],
+    "keybindings": [
+      { "command": "learningCopilot.showMenu", "key": "ctrl+alt+l" },
+      { "command": "learningCopilot.openExercises", "key": "ctrl+alt+x" },
+      { "command": "learningCopilot.showHintForTaskAtCursor", "key": "ctrl+alt+h", "when": "editorTextFocus && learningCopilot.taskAtCursor" },
+      { "command": "learningCopilot.markTaskDoneAtCursor", "key": "ctrl+alt+m", "when": "editorTextFocus && learningCopilot.taskAtCursor" },
+      { "command": "learningCopilot.applyTaskAtCursor", "key": "ctrl+alt+a", "when": "editorTextFocus && learningCopilot.taskAtCursor" },
+      { "command": "learningCopilot.applyNextTask", "key": "ctrl+alt+n", "when": "editorTextFocus" },
+      { "command": "learningCopilot.compareWithSolution", "key": "ctrl+alt+s", "when": "editorTextFocus" }
     ],
     "menus": {
       "editor/context": [

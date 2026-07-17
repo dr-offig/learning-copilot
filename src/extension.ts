@@ -16,6 +16,7 @@ import {
   normalizeRelativePath,
   type TaskRegionHit,
 } from "./masking";
+import { parseImageDimensions } from "./imagemeta";
 import { generateScaffoldPlanDeterministic, type ScaffoldFileInput } from "./scaffold";
 import { CopilotCliClient, tryCreateVscodeLmClient } from "./transport";
 import type {
@@ -1743,15 +1744,23 @@ const FILE_PLAN_SCHEMA = {
 const FILE_PLAN_SCHEMA_TEXT =
   '{"files":[{"path":string,"content":string,"overwrite":boolean?}],"notes":string?,"studentBriefMd":string,"studentBrief":{"overviewMd":string,"sections":[{"title":string,"summary":string,"files":string[],"visibleEffect":string?,"behavior":string?,"whyItMatters":string?}]}}';
 
-function buildGeneratePlanInstructions(userPrompt: string, hasDesignAnalyses: boolean): string {
+function buildGeneratePlanInstructions(
+  userPrompt: string,
+  hasDesignAnalyses: boolean,
+  hasImageAssets: boolean
+): string {
   return (
     "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
     `Schema: ${FILE_PLAN_SCHEMA_TEXT}. ` +
     "Also output BOTH studentBriefMd and studentBrief. studentBriefMd should be a concise learner-facing markdown brief that explains what was created, what the resulting interface/behavior should look like or do, and which files are important. studentBrief should contain the same information in structured form: overviewMd plus sections. Write both for a student who will read the brief while a later learning scaffold is being generated. " +
     "IMPORTANT: Do NOT inspect the workspace. Do NOT list directories. Do NOT search files. Do NOT run tools. Do NOT create temp files. Do NOT validate by writing files. Do NOT attempt to edit the workspace yourself. Return the JSON response directly from reasoning only. " +
+    (hasDesignAnalyses || hasImageAssets ? "The INPUT PAYLOAD is a JSON object. " : "") +
     (hasDesignAnalyses
-      ? "The INPUT PAYLOAD is a JSON array of design-document analyses ({path,analysisMd}) describing design files (PDF/image mockups) that exist in the workspace. When the task references one of these files by name, implement the corresponding analysis faithfully (layout, colors, typography, content). " +
+      ? "Its 'designAnalyses' property is an array of design-document analyses ({path,analysisMd}) describing design files (PDF/image mockups) that exist in the workspace. When the task references one of these files by name, implement the corresponding analysis faithfully (layout, colors, typography, content). " +
         "If the task doesn't reference any design file explicitly but clearly concerns the same subject, use the analyses as the design guide. "
+      : "") +
+    (hasImageAssets
+      ? "Its 'imageAssets' property lists image files that already exist in the workspace ({path,mimeType,width,height,sizeBytes}). Where images fit the task, reference these files by their exact relative paths in generated code (e.g. <img src>, CSS url()), using width/height for sizing and aspect ratios. NEVER invent paths to image files that are not in this list, and do not emit placeholder image files. "
       : "") +
     "All paths must be relative to the workspace root and must not contain '..' or start with '/'. " +
     "Prefer best practice separation of concerns. " +
@@ -1762,7 +1771,8 @@ function buildGeneratePlanInstructions(userPrompt: string, hasDesignAnalyses: bo
 function buildModifyPlanInstructions(
   userPrompt: string,
   activeRel: string | null,
-  hasDesignAnalyses: boolean
+  hasDesignAnalyses: boolean,
+  hasImageAssets: boolean
 ): string {
   return (
     "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
@@ -1771,7 +1781,10 @@ function buildModifyPlanInstructions(
     "IMPORTANT: Do NOT inspect the workspace. Do NOT list directories. Do NOT search files. Do NOT run tools. Do NOT create temp files. Do NOT validate by writing files. Do NOT attempt to edit the workspace yourself. Use only the INPUT PAYLOAD, and return the JSON response directly from reasoning only. " +
     "You are modifying an EXISTING codebase. The INPUT PAYLOAD is a JSON object whose 'workspaceFiles' property is an array of the current workspace files ({path,content})" +
     (hasDesignAnalyses
-      ? ", and whose 'designAnalyses' property is an array of analyses ({path,analysisMd}) of binary design documents (PDF/image mockups) in the workspace. When the task references one of these design files by name, implement the corresponding analysis faithfully (layout, colors, typography, content)"
+      ? ", whose 'designAnalyses' property is an array of analyses ({path,analysisMd}) of binary design documents (PDF/image mockups) in the workspace — when the task references one of these design files by name, implement the corresponding analysis faithfully (layout, colors, typography, content)"
+      : "") +
+    (hasImageAssets
+      ? ", and whose 'imageAssets' property lists image files that already exist in the workspace ({path,mimeType,width,height,sizeBytes}) — where images fit the task, reference these files by their exact relative paths in generated code (e.g. <img src>, CSS url()), using width/height for sizing and aspect ratios, and NEVER invent paths to image files that are not in this list"
       : "") +
     ". " +
     "Only include files that need to be created or changed. Do not include unchanged files. " +
@@ -2072,7 +2085,7 @@ async function persistScaffoldOutputs(args: {
 * filename, so a student prompt can simply say "follow homepage.pdf".
 */
 
-const DESIGN_ASSET_MIME_BY_EXT = new Map<string, string>([
+const DESIGN_DOC_MIME_BY_EXT = new Map<string, string>([
   [".pdf", "application/pdf"],
   [".png", "image/png"],
   [".jpg", "image/jpeg"],
@@ -2080,16 +2093,50 @@ const DESIGN_ASSET_MIME_BY_EXT = new Map<string, string>([
   [".gif", "image/gif"],
   [".webp", "image/webp"],
 ]);
+
+/** Extensions that can only ever be content assets, never design documents. */
+const CONTENT_ONLY_MIME_BY_EXT = new Map<string, string>([
+  [".svg", "image/svg+xml"],
+  [".ico", "image/x-icon"],
+]);
+
+/** Folder names whose images are design documents to analyze. */
+const DESIGN_DIR_NAMES = new Set([
+  "design", "designs", "mockup", "mockups", "wireframe", "wireframes", "comps",
+]);
+
+/** Folder names whose images are content assets for the student's site. */
+const ASSET_DIR_NAMES = new Set([
+  "asset", "assets", "image", "images", "img", "public", "static", "media",
+  "photos", "pictures", "icons", "sprites", "textures",
+]);
+
 const MAX_DESIGN_ASSETS = 12;
+const MAX_CONTENT_ASSETS = 100;
 const MAX_DESIGN_ASSET_BYTES = 20_000_000;
 /** The Language Model API caps image data parts at 5MB. */
 const MAX_LM_IMAGE_BYTES = 5_000_000;
 const DESIGN_CACHE_KEY = "learningCopilot.designAnalyses";
+const IMAGE_ROLE_CACHE_KEY = "learningCopilot.imageRoles";
 const DESIGN_NOTES_FILENAME = "LEARNING_DESIGNS.md";
 
 type DesignAnalysisRecord = { hash: string; analyzedAt: string; analysisMd: string };
 type DesignAnalysis = { path: string; analysisMd: string };
 type DesignAsset = { rel: string; uri: vscode.Uri; mimeType: string };
+
+/** How an image participates: studied by the model, or used by the site. */
+type ImageRole = "design" | "asset";
+
+/** Manifest entry describing a content asset to the model (no vision call). */
+type ImageAssetInfo = {
+  path: string;
+  mimeType: string;
+  width?: number;
+  height?: number;
+  sizeBytes: number;
+};
+
+type WorkspaceImages = { designDocs: DesignAsset[]; contentAssets: ImageAssetInfo[] };
 
 const DESIGN_ANALYSIS_SCHEMA = {
   type: "object",
@@ -2116,19 +2163,70 @@ function sha256Hex(data: Uint8Array): string {
 }
 
 /**
-* Finds analyzable design documents in the workspace (by extension), skipping
-* dot-directories and vendored folders.
+* Classifies an image by folder convention: design-ish folders mark design
+* documents, asset-ish folders mark site content; PDFs are always design
+* documents. Returns null when the location says nothing (e.g. workspace
+* root) — those files get a remembered one-time user choice.
 */
-async function findDesignAssets(wsRoot: vscode.Uri): Promise<DesignAsset[]> {
+function classifyImageByConvention(rel: string, mimeType: string): ImageRole | null {
+  if (mimeType === "application/pdf") { return "design"; }
+  const dirs = rel.split("/").slice(0, -1);
+  for (let i = dirs.length - 1; i >= 0; i--) {
+    const seg = dirs[i].toLowerCase();
+    if (DESIGN_DIR_NAMES.has(seg)) { return "design"; }
+    if (ASSET_DIR_NAMES.has(seg)) { return "asset"; }
+  }
+  return null;
+}
+
+/**
+* Reads pixel dimensions from an image file's header without decoding it.
+*/
+async function readImageDimensions(
+  absPath: string,
+  mimeType: string
+): Promise<{ width: number; height: number } | null> {
+  let handle: fsp.FileHandle;
+  try {
+    handle = await fsp.open(absPath, "r");
+  } catch {
+    return null;
+  }
+  try {
+    // JPEG EXIF blocks can push the size marker deep into the file.
+    const buf = Buffer.alloc(256 * 1024);
+    const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
+    return parseImageDimensions(buf.subarray(0, bytesRead), mimeType);
+  } catch {
+    return null;
+  } finally {
+    await handle.close().catch(() => { /* ignore */ });
+  }
+}
+
+/**
+* Scans the workspace for images/PDFs and partitions them into design
+* documents (analyzed by a vision model) and content assets (listed to the
+* model so generated code can reference them by path — no vision call).
+* Folder conventions decide most files; anything ambiguous triggers a
+* one-time multi-select prompt whose answers are remembered per file.
+*/
+async function discoverWorkspaceImages(
+  context: vscode.ExtensionContext,
+  wsRoot: vscode.Uri
+): Promise<WorkspaceImages> {
   const exclude = getWorkspaceScanExcludeGlob();
   const uris = await vscode.workspace.findFiles("**/*", exclude, 2000);
 
-  const found: DesignAsset[] = [];
+  type Candidate = { rel: string; uri: vscode.Uri; mimeType: string; role: ImageRole | null };
+  const candidates: Candidate[] = [];
   for (const uri of uris) {
     if (uri.scheme !== "file") { continue; }
     const rel = path.relative(wsRoot.fsPath, uri.fsPath).replace(/\\/g, "/");
     if (rel.startsWith("..") || rel.split("/").some((seg) => seg.startsWith("."))) { continue; }
-    const mimeType = DESIGN_ASSET_MIME_BY_EXT.get(path.posix.extname(rel).toLowerCase());
+    const ext = path.posix.extname(rel).toLowerCase();
+    const contentOnlyMime = CONTENT_ONLY_MIME_BY_EXT.get(ext);
+    const mimeType = DESIGN_DOC_MIME_BY_EXT.get(ext) ?? contentOnlyMime;
     if (!mimeType) { continue; }
     let safeRel: string;
     try {
@@ -2136,17 +2234,77 @@ async function findDesignAssets(wsRoot: vscode.Uri): Promise<DesignAsset[]> {
     } catch {
       continue;
     }
-    found.push({ rel: safeRel, uri, mimeType });
+    const role = contentOnlyMime ? "asset" : classifyImageByConvention(safeRel, mimeType);
+    candidates.push({ rel: safeRel, uri, mimeType, role });
+  }
+  candidates.sort((a, b) => a.rel.localeCompare(b.rel));
+
+  // Remembered answers for images whose location doesn't classify them.
+  const roles = {
+    ...(context.workspaceState.get<Record<string, ImageRole>>(IMAGE_ROLE_CACHE_KEY) ?? {}),
+  };
+  const present = new Set(candidates.map((c) => c.rel));
+  for (const rel of Object.keys(roles)) {
+    if (!present.has(rel)) { delete roles[rel]; }
   }
 
-  found.sort((a, b) => a.rel.localeCompare(b.rel));
-  if (found.length > MAX_DESIGN_ASSETS) {
-    vscode.window.showWarningMessage(
-      `Found ${found.length} design files; only the first ${MAX_DESIGN_ASSETS} will be analyzed.`
+  const unclassified = candidates.filter((c) => c.role === null && !roles[c.rel]);
+  if (unclassified.length > 0) {
+    const picks = await vscode.window.showQuickPick(
+      unclassified.map((c) => ({ label: c.rel })),
+      {
+        title: "Learning Copilot: Which of these images are design mockups?",
+        placeHolder:
+          "Selected images are analyzed as designs; the rest become site assets your code can use. Tip: use designs/ and assets/ folders to skip this question.",
+        canPickMany: true,
+      }
     );
-    found.length = MAX_DESIGN_ASSETS;
+    if (picks !== undefined) {
+      const chosen = new Set(picks.map((p) => p.label));
+      for (const c of unclassified) {
+        roles[c.rel] = chosen.has(c.rel) ? "design" : "asset";
+      }
+    }
+    // On cancel: treat as assets for this run only, without remembering.
   }
-  return found;
+  await context.workspaceState.update(IMAGE_ROLE_CACHE_KEY, roles);
+
+  const designDocs: DesignAsset[] = [];
+  const contentAssets: ImageAssetInfo[] = [];
+  for (const c of candidates) {
+    const role = c.role ?? roles[c.rel] ?? "asset";
+    if (role === "design") {
+      designDocs.push({ rel: c.rel, uri: c.uri, mimeType: c.mimeType });
+      continue;
+    }
+    let sizeBytes: number;
+    try {
+      sizeBytes = (await fsp.stat(c.uri.fsPath)).size;
+    } catch {
+      continue;
+    }
+    const dims = await readImageDimensions(c.uri.fsPath, c.mimeType);
+    contentAssets.push({
+      path: c.rel,
+      mimeType: c.mimeType,
+      ...(dims ? { width: dims.width, height: dims.height } : {}),
+      sizeBytes,
+    });
+  }
+
+  if (designDocs.length > MAX_DESIGN_ASSETS) {
+    vscode.window.showWarningMessage(
+      `Found ${designDocs.length} design documents; only the first ${MAX_DESIGN_ASSETS} will be analyzed.`
+    );
+    designDocs.length = MAX_DESIGN_ASSETS;
+  }
+  if (contentAssets.length > MAX_CONTENT_ASSETS) {
+    vscode.window.showWarningMessage(
+      `Found ${contentAssets.length} image assets; only the first ${MAX_CONTENT_ASSETS} will be listed to the model.`
+    );
+    contentAssets.length = MAX_CONTENT_ASSETS;
+  }
+  return { designDocs, contentAssets };
 }
 
 /**
@@ -2202,21 +2360,21 @@ async function writeDesignNotesFile(
 }
 
 /**
-* Ensures every design asset in the workspace has an up-to-date cached
-* analysis, running model calls only for new or changed files. Returns all
-* current analyses (cached + fresh) plus how many were (re)analyzed now.
+* Ensures every given design document has an up-to-date cached analysis,
+* running model calls only for new or changed files. Returns all current
+* analyses (cached + fresh) plus how many were (re)analyzed now.
 */
 async function ensureDesignAnalyses(args: {
   context: vscode.ExtensionContext;
   wsRoot: vscode.Uri;
   runtime: LlmRuntime;
   output: vscode.OutputChannel;
+  assets: DesignAsset[];
   force?: boolean;
   report?: (message: string) => void;
 }): Promise<{ analyses: DesignAnalysis[]; analyzedCount: number }> {
-  const { context, wsRoot, runtime, output, force, report } = args;
+  const { context, wsRoot, runtime, output, assets, force, report } = args;
 
-  const assets = await findDesignAssets(wsRoot);
   const cache = {
     ...(context.workspaceState.get<Record<string, DesignAnalysisRecord>>(DESIGN_CACHE_KEY) ?? {}),
   };
@@ -2806,10 +2964,14 @@ export async function activate(context: vscode.ExtensionContext) {
       output.show(true);
       output.appendLine(`Using transport: ${runtime.client.label}`);
 
-      // Analyze any design documents (PDF/image mockups) so the plan prompt
-      // can honor references to them by filename. Cached analyses are reused.
+      // Partition workspace images: design documents get analyzed (cached
+      // analyses are reused), content assets are listed to the model so
+      // generated code can reference them by path.
       let designAnalyses: DesignAnalysis[] = [];
+      let imageAssets: ImageAssetInfo[] = [];
       try {
+        const images = await discoverWorkspaceImages(context, wsRoot);
+        imageAssets = images.contentAssets;
         const designResult = await vscode.window.withProgress(
           {
             location: vscode.ProgressLocation.Notification,
@@ -2822,6 +2984,7 @@ export async function activate(context: vscode.ExtensionContext) {
               wsRoot,
               runtime,
               output,
+              assets: images.designDocs,
               report: (message) => progress.report({ message }),
             })
         );
@@ -2837,8 +3000,18 @@ export async function activate(context: vscode.ExtensionContext) {
       let planError: string | null = null;
       try {
         planRaw = await runtime.client.requestJson({
-          instructions: buildGeneratePlanInstructions(userPrompt, designAnalyses.length > 0),
-          payload: designAnalyses.length > 0 ? JSON.stringify(designAnalyses) : undefined,
+          instructions: buildGeneratePlanInstructions(
+            userPrompt,
+            designAnalyses.length > 0,
+            imageAssets.length > 0
+          ),
+          payload:
+            designAnalyses.length > 0 || imageAssets.length > 0
+              ? JSON.stringify({
+                  ...(designAnalyses.length > 0 ? { designAnalyses } : {}),
+                  ...(imageAssets.length > 0 ? { imageAssets } : {}),
+                })
+              : undefined,
           requiredKeys: ["files"],
           schemaName: "emit_file_plan",
           schema: FILE_PLAN_SCHEMA,
@@ -3351,16 +3524,20 @@ export async function activate(context: vscode.ExtensionContext) {
             if (!runtime) { return; }
             output.appendLine(`Using transport: ${runtime.client.label}`);
 
-            // Analyze any design documents (PDF/image mockups) so the plan
-            // prompt can honor references to them by filename. Cached
-            // analyses are reused for unchanged files.
+            // Partition workspace images: design documents get analyzed
+            // (cached analyses are reused), content assets are listed to the
+            // model so generated code can reference them by path.
             let designAnalyses: DesignAnalysis[] = [];
+            let imageAssets: ImageAssetInfo[] = [];
             try {
+              const images = await discoverWorkspaceImages(context, wsRoot);
+              imageAssets = images.contentAssets;
               const designResult = await ensureDesignAnalyses({
                 context,
                 wsRoot,
                 runtime,
                 output,
+                assets: images.designDocs,
                 report: (message) => reportActivity(progress, output, modifyStartedAt, message, message),
               });
               designAnalyses = designResult.analyses;
@@ -3372,10 +3549,16 @@ export async function activate(context: vscode.ExtensionContext) {
             let planRaw: unknown;
             try {
               planRaw = await runtime.client.requestJson({
-                instructions: buildModifyPlanInstructions(userPrompt, activeRel, designAnalyses.length > 0),
+                instructions: buildModifyPlanInstructions(
+                  userPrompt,
+                  activeRel,
+                  designAnalyses.length > 0,
+                  imageAssets.length > 0
+                ),
                 payload: JSON.stringify({
                   workspaceFiles: ctxFiles,
                   ...(designAnalyses.length > 0 ? { designAnalyses } : {}),
+                  ...(imageAssets.length > 0 ? { imageAssets } : {}),
                 }),
                 requiredKeys: ["files"],
                 schemaName: "emit_file_plan",
@@ -3584,10 +3767,12 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      const assets = await findDesignAssets(wsRoot);
-      if (assets.length === 0) {
+      const images = await discoverWorkspaceImages(context, wsRoot);
+      if (images.designDocs.length === 0) {
         vscode.window.showInformationMessage(
-          "No design files found in this workspace (looked for PDF, PNG, JPEG, GIF, and WebP files)."
+          images.contentAssets.length > 0
+            ? `No design documents to analyze. ${images.contentAssets.length} image asset(s) found — these are supplied to prompts automatically without analysis.`
+            : "No design files found in this workspace (looked for PDF, PNG, JPEG, GIF, and WebP files)."
         );
         return;
       }
@@ -3610,6 +3795,7 @@ export async function activate(context: vscode.ExtensionContext) {
               wsRoot,
               runtime,
               output,
+              assets: images.designDocs,
               force,
               report: (message) => progress.report({ message }),
             })

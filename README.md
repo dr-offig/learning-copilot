@@ -31,23 +31,33 @@ It also supports:
 - revealing/applied blank solutions at cursor or next blank
 - marking blanks done while keeping your own implementation
 
-## Design Files (PDFs and Images)
+## Design Files and Image Assets
 
-Drop design documents (PDF mockups, PNG/JPEG/GIF/WebP wireframes) into the
-workspace and Learning Copilot analyzes them with a vision-capable model:
+Workspace images play one of two roles:
 
-- Each file is analyzed once and the description cached (keyed by content
-  hash), so unchanged files are never re-analyzed.
-- Analyses are written to `LEARNING_DESIGNS.md` so students can read what the
-  model saw.
-- Prompts can then reference a design by filename, e.g. *"build the site
-  following homepage.pdf"* — the cached analysis is supplied to the model
-  automatically during Create or Update Project from Prompt.
-- Run `Learning Copilot: Analyze Design Files` to analyze up front or refresh
-  after editing a design.
+- **Design documents** — pictures *of* the site (PDF mockups, PNG/JPEG/GIF/WebP
+  wireframes). These are analyzed once by a vision-capable model; the
+  description is cached (keyed by content hash) so unchanged files are never
+  re-analyzed, and written to `LEARNING_DESIGNS.md` so students can read what
+  the model saw. Prompts can then reference a design by filename, e.g.
+  *"build the site following homepage.pdf"*.
+- **Content assets** — pictures *for* the site (photos, logos, icons, plus
+  SVG/ICO). These cost no AI calls: the extension reads their pixel
+  dimensions locally from the file headers and lists them to the model, which
+  is instructed to reference them by their exact relative paths in generated
+  code (`<img src>`, CSS `url()`) and never invent image paths that don't
+  exist.
 
-PDF analysis uses the Copilot CLI (the VS Code Language Model API only
-accepts images); images work on either transport.
+Folder conventions decide the role automatically: images under `designs/`,
+`mockups/`, or `wireframes/` are design documents; images under `assets/`,
+`images/`, `img/`, `public/`, `static/`, `media/`, `photos/`, or `icons/` are
+content assets; PDFs are always design documents. Images anywhere else (e.g.
+the workspace root) trigger a one-time multi-select question whose answers
+are remembered per file.
+
+Run `Learning Copilot: Analyze Design Files` to analyze up front or refresh
+after editing a design. PDF analysis uses the Copilot CLI (the VS Code
+Language Model API only accepts images); images work on either transport.
 
 ## Requirements
 
@@ -91,6 +101,27 @@ in the Command Palette:
 - `Learning Copilot: Mark Task As Done At Cursor`
 - `Learning Copilot: Open Latest Answer Key`
 - `Learning Copilot: Install/Setup Copilot CLI` (and login/logout/details/set path)
+
+## Keyboard Shortcuts
+
+Default shortcuts (all rebindable via `Preferences: Open Keyboard Shortcuts`,
+searching for "Learning Copilot"):
+
+| Shortcut | Command | Available |
+| --- | --- | --- |
+| `Ctrl+Alt+L` | Open Menu | always |
+| `Ctrl+Alt+X` | Open Learning Exercises | always |
+| `Ctrl+Alt+H` | Show Hint For Task At Cursor | cursor inside a task |
+| `Ctrl+Alt+M` | Mark Task As Done At Cursor | cursor inside a task |
+| `Ctrl+Alt+A` | Apply Solution For Task At Cursor | cursor inside a task |
+| `Ctrl+Alt+N` | Apply Solution For Next Task | editor focused |
+| `Ctrl+Alt+S` | Compare Active File With Solution | editor focused |
+
+The same `Ctrl+Alt` combinations are used on macOS (Control+Option), so the
+shortcuts are identical on lab machines and personal laptops. The letters are
+chosen to avoid the `Ctrl+Alt` hotkeys claimed globally by common macOS window
+managers (Magnet, Rectangle, Spectacle): C, D, E, F, G, R, T, U, I, J, K,
+arrows, and Return.
 
 ## Settings
 
