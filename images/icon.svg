@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7C9CC0"/>
+      <stop offset="1" stop-color="#4E6E92"/>
+    </linearGradient>
+
+    <!-- brushed-steel body: highlight, core shadow, then bounce light at the base -->
+    <linearGradient id="metal" x1="0.3" y1="0" x2="0.7" y2="1">
+      <stop offset="0" stop-color="#FCFDFE"/>
+      <stop offset="0.18" stop-color="#E2E9F1"/>
+      <stop offset="0.46" stop-color="#B6C4D5"/>
+      <stop offset="0.64" stop-color="#9FAEC1"/>
+      <stop offset="0.84" stop-color="#C6D2DE"/>
+      <stop offset="1" stop-color="#DFE7EE"/>
+    </linearGradient>
+
+    <linearGradient id="earMetal" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#EDF2F7"/>
+      <stop offset="0.5" stop-color="#AEBCCB"/>
+      <stop offset="1" stop-color="#8E9EB0"/>
+    </linearGradient>
+
+    <!-- shadow cast by the overhanging board -->
+    <linearGradient id="capShadow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2B3644" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#2B3644" stop-opacity="0"/>
+    </linearGradient>
+
+    <radialGradient id="lens" cx="0.38" cy="0.32" r="0.85">
+      <stop offset="0" stop-color="#33414F"/>
+      <stop offset="0.55" stop-color="#161F29"/>
+      <stop offset="1" stop-color="#0A1017"/>
+    </radialGradient>
+
+    <clipPath id="headClip">
+      <rect x="72" y="118" width="112" height="98" rx="28"/>
+    </clipPath>
+  </defs>
+
+  <!-- background -->
+  <rect x="0" y="0" width="256" height="256" rx="52" fill="url(#bg)"/>
+
+  <!-- ears -->
+  <rect x="56" y="148" width="14" height="34" rx="7" fill="url(#earMetal)"/>
+  <rect x="186" y="148" width="14" height="34" rx="7" fill="url(#earMetal)"/>
+  <rect x="59" y="152" width="3" height="20" rx="1.5" fill="#FFFFFF" opacity="0.55"/>
+  <rect x="189" y="152" width="3" height="20" rx="1.5" fill="#FFFFFF" opacity="0.55"/>
+
+  <!-- head -->
+  <rect x="72" y="118" width="112" height="98" rx="28" fill="url(#metal)"/>
+  <g clip-path="url(#headClip)">
+    <rect x="72" y="118" width="112" height="30" fill="url(#capShadow)"/>
+  </g>
+  <rect x="72" y="118" width="112" height="98" rx="28" fill="none" stroke="#6F8090" stroke-opacity="0.45" stroke-width="2"/>
+
+  <!-- eyes -->
+  <circle cx="108" cy="166" r="11" fill="url(#lens)"/>
+  <circle cx="148" cy="166" r="11" fill="url(#lens)"/>
+  <circle cx="112" cy="162" r="3.5" fill="#F4F8FC"/>
+  <circle cx="152" cy="162" r="3.5" fill="#F4F8FC"/>
+  <path d="M101 173 Q108 178 115 173" fill="none" stroke="#7C8DA0" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
+  <path d="M141 173 Q148 178 155 173" fill="none" stroke="#7C8DA0" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
+
+  <!-- mouth -->
+  <path d="M112 190 Q128 201 144 190" fill="none" stroke="#8496A8" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- mortarboard: skull cap, then board -->
+  <path d="M84 124 C84 92, 172 92, 172 124 Z" fill="#28323F"/>
+  <polygon points="128,64 226,96 128,128 30,96" fill="#0B0F14"/>
+
+  <!-- tassel -->
+  <path d="M220 100 C223 122, 220 134, 216 146" fill="none" stroke="#F0B429" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="215" cy="152" r="7" fill="#F0B429"/>
+  <rect x="209" y="155" width="13" height="22" rx="6.5" fill="#D99A20"/>
+</svg>

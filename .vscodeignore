@@ -1,15 +1,34 @@
-.vscode/**
-.vscode-test/**
+# Everything the extension actually runs from lives in dist/ (see "main"),
+# bundled by esbuild. Nothing below is needed at runtime.
+
+# --- Source and build tooling ---
+src/**
 out/**
 node_modules/**
-src/**
-.gitignore
-.yarnrc
 esbuild.js
-vsc-extension-quickstart.md
 **/tsconfig.json
 **/eslint.config.mjs
-**/*.map
 **/*.ts
+**/*.map
+
+# --- Editor and test harness ---
+.vscode/**
+.vscode-test/**
 **/.vscode-test.*
-images/icon.svg
+
+# --- Repo and local tooling config ---
+.git/**
+.gitignore
+.gitattributes
+.yarnrc
+.claude/**
+package-lock.json
+vsc-extension-quickstart.md
+
+# --- Build artifacts and OS cruft ---
+*.vsix
+**/.DS_Store
+
+# --- Assets: ship the packaged icon only, not the editable source ---
+images/**
+!images/icon.png

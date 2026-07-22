@@ -3,7 +3,7 @@
   "publisher": "dr-offig",
   "displayName": "learning-copilot",
   "description": "AI code generator that creates learning tasks and exercises",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "repository" : {
     "type": "git",
     "url": "https://github.com/dr-offig/learning-copilot.git"
@@ -13,7 +13,7 @@
   },
   "icon": "images/icon.png",
   "galleryBanner": {
-    "color": "#1E293B",
+    "color": "#4E6E92",
     "theme": "dark"
   },
   "categories": [
