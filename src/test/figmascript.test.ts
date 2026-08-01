@@ -2,8 +2,10 @@ import * as assert from 'assert';
 
 import {
 	DELIVERY_MODES,
+	PROBE_SENTINEL,
 	SENTINEL,
 	buildExtractorScript,
+	buildProbeScript,
 	readExtractorResult,
 } from '../figmascript';
 
@@ -100,6 +102,69 @@ suite('figma extractor script', () => {
 		assert.ok(walk.includes('frames.length = 0'));
 		// Capped, because the payload rides back inside an error message.
 		assert.ok(walk.includes('frames.length >= 200'));
+		// A failure is now named in the report, so the next silent empty list
+		// is diagnosable from the cached JSON instead of a metered probe.
+		assert.ok(walk.includes('summary.frameError'));
+	});
+
+	test('an unsupported loadAllPagesAsync cannot abort the frame walk', () => {
+		const script = buildExtractorScript('throw');
+		const walk = script.slice(script.indexOf('const frames = []'), script.indexOf('const isArtboard'));
+
+		// Measured: inside use_figma the property exists but calling it throws
+		// '"loadAllPagesAsync" is not a supported API'. A typeof guard passes,
+		// the call throws, and the outer catch used to discard every frame.
+		assert.ok(walk.includes('loadAllPagesAsync'));
+		assert.ok(
+			(walk.match(/try\s*\{/g) ?? []).length >= 2,
+			'the optional page-load call needs its own catch, not just the outer one'
+		);
+	});
+});
+
+suite('figma api probe', () => {
+	test('it parses as valid JavaScript', () => {
+		assert.doesNotThrow(() => new Function('figma', `return (async () => {${buildProbeScript()}})()`));
+	});
+
+	test('it reports failures instead of swallowing them', () => {
+		const script = buildProbeScript();
+
+		// The extractor's frame walk hid its own error behind a catch that
+		// emptied the list; the whole point of the probe is not to do that.
+		for (const step of ['loadAllPagesAsync:', 'figma.root.children:', 'figma.currentPage:']) {
+			assert.ok(script.includes(`'${step} '`), `should record a failure of ${step}`);
+		}
+		assert.ok(script.includes('out.errors.push'));
+		// Each step is caught separately, so one restricted call cannot mask
+		// the results of the others.
+		assert.ok((script.match(/catch \(e\)/g) ?? []).length >= 4);
+	});
+
+	test('it probes the API surface the richer plans would need', () => {
+		const script = buildProbeScript();
+
+		for (const key of ['hasRoot', 'hasCurrentPage', 'hasLoadAllPages', 'pageCount', 'childCount']) {
+			assert.ok(script.includes(key), `should report ${key}`);
+		}
+	});
+
+	test('its output cannot be mistaken for a token report', () => {
+		assert.notStrictEqual(PROBE_SENTINEL, SENTINEL);
+		assert.ok(buildProbeScript().includes(JSON.stringify(PROBE_SENTINEL)));
+		assert.ok(!buildProbeScript().includes(JSON.stringify(SENTINEL)));
+
+		// A probe result fed to the report reader is rejected, not half-read.
+		const probeOutput = `Error: ${PROBE_SENTINEL}{"api":{"pageCount":2},"pages":[],"errors":[]}`;
+		assert.ok(!readExtractorResult(probeOutput).ok);
+	});
+
+	test('its payload is capped so the diagnostic cannot itself truncate', () => {
+		const script = buildProbeScript();
+
+		assert.ok(script.includes('pages.slice(0, 20)'));
+		assert.ok(script.includes('kids.slice(0, 5)'));
+		assert.ok(script.includes('.slice(0, 40)'), 'layer names should be trimmed');
 	});
 });
 

@@ -165,7 +165,13 @@ async function extractFigmaTokens() {
   // message, and neither may be put at risk for advisory context.
   const frames = [];
   try {
-    if (typeof figma.loadAllPagesAsync === 'function') { await figma.loadAllPagesAsync(); }
+    // Inside use_figma the property exists but calling it throws
+    // '"loadAllPagesAsync" is not a supported API', so a typeof guard is not
+    // enough — and pages are already loaded here, making the call optional.
+    // Letting it abort the walk is what silently produced no frames at all.
+    try {
+      if (typeof figma.loadAllPagesAsync === 'function') { await figma.loadAllPagesAsync(); }
+    } catch (e) { /* already loaded in this context */ }
     const isArtboard = (n) => n && (n.type === 'FRAME' || n.type === 'COMPONENT') && typeof n.width === 'number';
     const add = (n, pageName) => {
       frames.push({ name: n.name, width: Math.round(n.width), height: Math.round(n.height), page: pageName });
@@ -186,6 +192,10 @@ async function extractFigmaTokens() {
     }
   } catch (e) {
     frames.length = 0;
+    // Recorded rather than swallowed: an empty frame list used to be
+    // indistinguishable from a design with no artboards, and telling those
+    // apart previously cost a metered diagnostic call.
+    summary.frameError = (e && e.message) ? e.message : String(e);
   }
   summary.frames = frames.length;
 
@@ -207,6 +217,95 @@ export function buildExtractorScript(deliver: DeliveryMode): string {
     ? "// Deliberate — see the header. This is how the results get back.\nthrow new Error(__lcPayload);"
     : "__lcPayload;";
   return `${EXTRACTOR_HEADER}\n\n${body}\n${tail}\n`;
+}
+
+/**
+ * Marks probe output. Distinct from `SENTINEL` so a probe result can never be
+ * mistaken for a token report by `readExtractorResult`.
+ */
+export const PROBE_SENTINEL = "LC_FIGMA_PROBE_V1:";
+
+/**
+ * Builds a diagnostic script that reports what the Plugin API actually offers
+ * inside `use_figma`.
+ *
+ * The extractor's frame walk comes back empty — `summary.frames: 0` proves the
+ * code ran and kept nothing — but its `try/catch` swallows the reason, and
+ * every richer use of the Plugin API (a structural outline of the layouts,
+ * for instance) depends on the same traversal. This answers the question for
+ * one metered call.
+ *
+ * Deliberately tiny and deliberately noisy about failure: each step is caught
+ * separately and its error message recorded, so one restricted call cannot
+ * hide the rest. Output is capped so the payload cannot itself truncate.
+ */
+export function buildProbeScript(): string {
+  return `/* ---------------------------------------------------------------------------
+ * Learning Copilot — Figma API probe (diagnostic)
+ *
+ * WHAT THIS DOES: reports which parts of the Figma Plugin API are reachable
+ * here, and how many pages and top-level layers this file has.
+ *
+ * IT DOES NOT CHANGE YOUR DESIGN, and it reads no content — only names,
+ * types and counts.
+ *
+ * IT ENDS BY THROWING AN ERROR ON PURPOSE: Figma discards return values, so
+ * results come back as error text. Seeing that error means it worked.
+ * ------------------------------------------------------------------------ */
+
+const out = { api: {}, pages: [], errors: [] };
+const msg = (e) => (e && e.message) ? e.message : String(e);
+
+try {
+  out.api = {
+    editorType: figma.editorType,
+    mode: figma.mode,
+    hasRoot: typeof figma.root !== 'undefined',
+    hasCurrentPage: typeof figma.currentPage !== 'undefined',
+    hasLoadAllPages: typeof figma.loadAllPagesAsync === 'function',
+    hasVariablesApi: !!(figma.variables && typeof figma.variables.getLocalVariableCollectionsAsync === 'function'),
+    hasTextStylesApi: typeof figma.getLocalTextStylesAsync === 'function',
+  };
+} catch (e) { out.errors.push('api probe: ' + msg(e)); }
+
+// Newer API versions load pages lazily; reaching page children without this
+// throws, which is the leading suspect for the empty frame list.
+try {
+  if (typeof figma.loadAllPagesAsync === 'function') {
+    await figma.loadAllPagesAsync();
+    out.api.loadAllPagesOk = true;
+  }
+} catch (e) { out.errors.push('loadAllPagesAsync: ' + msg(e)); }
+
+try {
+  const pages = figma.root.children;
+  out.api.pageCount = pages.length;
+  for (const page of pages.slice(0, 20)) {
+    const entry = { name: page.name, childCount: null, types: {}, sample: [] };
+    try {
+      const kids = page.children;
+      entry.childCount = kids.length;
+      for (const n of kids) { entry.types[n.type] = (entry.types[n.type] || 0) + 1; }
+      for (const n of kids.slice(0, 5)) {
+        entry.sample.push({
+          name: String(n.name).slice(0, 40),
+          type: n.type,
+          width: typeof n.width === 'number' ? Math.round(n.width) : null,
+        });
+      }
+    } catch (e) { entry.error = msg(e); }
+    out.pages.push(entry);
+  }
+} catch (e) { out.errors.push('figma.root.children: ' + msg(e)); }
+
+// Fallback route: if only the open page is reachable, a traversal is still
+// possible, just scoped to whatever the student has selected.
+try {
+  out.currentPage = { name: figma.currentPage.name, childCount: figma.currentPage.children.length };
+} catch (e) { out.errors.push('figma.currentPage: ' + msg(e)); }
+
+throw new Error(${JSON.stringify(PROBE_SENTINEL)} + JSON.stringify(out));
+`;
 }
 
 /**
