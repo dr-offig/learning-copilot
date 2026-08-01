@@ -55,6 +55,12 @@ export type StudentBrief = {
 
 export type ScaffoldContextFile = { path: string; content: string };
 
+/** How an image participates: studied by the model, or used by the site. */
+export type ImageRole = "design" | "asset";
+
+/** A cached vision-model description of one design document. */
+export type DesignAnalysisRecord = { hash: string; analyzedAt: string; analysisMd: string };
+
 export type FocusFileWithDiff = {
   rel: string;
   fullContent: string;

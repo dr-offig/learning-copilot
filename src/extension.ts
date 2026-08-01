@@ -11,16 +11,44 @@ import {
   findNextTaskRegion,
   findTaskRegionAtPosition,
   formatRangesForPrompt,
-  getRegionStartLine,
   listTaskRegions,
   normalizeRelativePath,
   type TaskRegionHit,
 } from "./masking";
 import { parseImageDimensions } from "./imagemeta";
 import { generateScaffoldPlanDeterministic, type ScaffoldFileInput } from "./scaffold";
+import {
+  copyDirInto,
+  emptyScaffoldState,
+  getAnswerKeysDir,
+  getLatestAnswerKeyPath,
+  getSolutionsDir,
+  hasSolutionSnapshot,
+  hasStateFile,
+  readScaffoldState,
+  readScaffoldStateSync,
+  readSolutionFile,
+  writeAnswerKey,
+  writeScaffoldState,
+  writeSolutionSnapshot,
+  STATE_DIR_NAME,
+  type WorkspaceScaffoldState,
+} from "./state";
+import {
+  buildTaskJumpLinks,
+  getCompletedTaskKeySet,
+  getTaskStateKey,
+  listMarkedTaskKeys,
+  prependTaskLinksSection,
+  refreshTaskLinksSection,
+  TASK_LINKS_END,
+  TASK_LINKS_START,
+} from "./tasklinks";
 import { CopilotCliClient, tryCreateVscodeLmClient } from "./transport";
 import type {
+  DesignAnalysisRecord,
   FocusFileWithDiff,
+  ImageRole,
   LlmJsonClient,
   ScaffoldContextFile,
   ScaffoldPlan,
@@ -85,7 +113,6 @@ function logDuration(
 const proposedContent = new Map<string, string>();
 const PROPOSED_SCHEME = "learning-copilot";
 const SOLUTION_SCHEME = "learning-copilot-solution";
-const EXTENSION_URI_ID = "dr-offig.learning-copilot";
 
 type StudentBriefLike = {
   files: Array<{ path: string; content: string; overwrite?: boolean }>;
@@ -481,167 +508,201 @@ async function ensureStorageDir(context: vscode.ExtensionContext): Promise<strin
   return context.globalStorageUri.fsPath;
 }
 
-// Scaffold state is stored per-workspace (workspaceState) so switching
-// workspaces never mixes one project's tasks/solutions with another's.
-const SCAFFOLD_TASKS_STATE_KEY = "learningCopilot.lastScaffoldTasks";
-const SNAPSHOT_DIR_STATE_KEY = "learningCopilot.lastSnapshotDir";
-const ANSWER_KEY_PATH_STATE_KEY = "learningCopilot.lastAnswerKeyPath";
-
-/** How many timestamped snapshots/answer keys to retain per workspace. */
-const PRIVATE_OUTPUTS_KEEP = 5;
+/*
+* Scaffold state lives in `.learning-copilot/` inside the workspace (see
+* state.ts). The keys below are only read during migration: earlier versions
+* kept tasks in VS Code's `workspaceState` and snapshots/answer keys in global
+* storage, both of which are keyed by the workspace's absolute path and so are
+* lost whenever the project folder is copied, renamed, or moved.
+*/
+const LEGACY_SCAFFOLD_TASKS_STATE_KEY = "learningCopilot.lastScaffoldTasks";
+const LEGACY_SNAPSHOT_DIR_STATE_KEY = "learningCopilot.lastSnapshotDir";
+const LEGACY_ANSWER_KEY_PATH_STATE_KEY = "learningCopilot.lastAnswerKeyPath";
+const LEGACY_DESIGN_CACHE_KEY = "learningCopilot.designAnalyses";
+const LEGACY_IMAGE_ROLE_CACHE_KEY = "learningCopilot.imageRoles";
 
 /**
-* Returns a stable folder name identifying a workspace inside global storage,
-* combining the (sanitized) folder basename for readability with a hash of
-* the full path for uniqueness.
+* In-memory mirror of the current workspace's `.learning-copilot/state.json`.
+* The file is the source of truth; this cache exists because task decorations
+* and the solution diff provider need synchronous reads.
+*/
+let scaffoldStateCache: WorkspaceScaffoldState = emptyScaffoldState();
+let scaffoldStateRoot: string | null = null;
+
+/**
+* Loads the workspace's scaffold state into the cache. Call on activation and
+* whenever the open folder changes.
 *
 * @param wsRoot Workspace root URI.
 */
-function workspaceStorageKey(wsRoot: vscode.Uri): string {
+async function loadScaffoldState(wsRoot: vscode.Uri): Promise<WorkspaceScaffoldState> {
+  scaffoldStateCache = await readScaffoldState(wsRoot.fsPath);
+  scaffoldStateRoot = wsRoot.fsPath;
+  return scaffoldStateCache;
+}
+
+/**
+* Returns the cached scaffold state, re-reading from disk if the cache belongs
+* to a different folder than the one currently open.
+*/
+function getScaffoldState(): WorkspaceScaffoldState {
+  const wsRoot = getWorkspaceRootUri();
+  if (!wsRoot) { return emptyScaffoldState(); }
+  if (scaffoldStateRoot !== wsRoot.fsPath) {
+    scaffoldStateCache = readScaffoldStateSync(wsRoot.fsPath);
+    scaffoldStateRoot = wsRoot.fsPath;
+  }
+  return scaffoldStateCache;
+}
+
+/** Tasks stored for the current workspace. */
+function getScaffoldTasks(): ScaffoldTask[] {
+  return getScaffoldState().tasks;
+}
+
+/**
+* Applies a change to the workspace's scaffold state and persists it.
+*
+* @param wsRoot Workspace root URI.
+* @param mutate Produces the new state from the current state.
+*/
+async function updateScaffoldState(
+  wsRoot: vscode.Uri,
+  mutate: (state: WorkspaceScaffoldState) => WorkspaceScaffoldState
+): Promise<void> {
+  const next = mutate(getScaffoldState());
+  scaffoldStateCache = next;
+  scaffoldStateRoot = wsRoot.fsPath;
+  await writeScaffoldState(wsRoot.fsPath, next);
+}
+
+/**
+* Per-workspace global-storage directory used by versions that predate
+* `.learning-copilot/`. Only used to find state worth migrating.
+*
+* @param context VS Code extension context.
+* @param wsRoot Workspace root URI.
+*/
+function legacyWorkspaceStorageDir(context: vscode.ExtensionContext, wsRoot: vscode.Uri): string {
   const hash = crypto.createHash("sha1").update(wsRoot.fsPath).digest("hex").slice(0, 12);
   const base = path.basename(wsRoot.fsPath).replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 40);
-  return base ? `${base}-${hash}` : hash;
+  return path.join(context.globalStorageUri.fsPath, "workspaces", base ? `${base}-${hash}` : hash);
+}
+
+/** Newest entry of a directory of timestamped outputs, or null. */
+function newestEntry(dir: string, filter?: (name: string) => boolean): string | null {
+  try {
+    const names = fs.readdirSync(dir).filter((name) => filter?.(name) ?? true).sort();
+    const latest = names[names.length - 1];
+    return latest ? path.join(dir, latest) : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
-* Ensures the per-workspace private-output directory (solution snapshots and
-* answer keys) exists inside global storage, and returns its path.
+* Adopts scaffold state saved by earlier versions into `.learning-copilot/`.
+*
+* Tasks come from this workspace's `workspaceState`, or — for versions older
+* still, which shared one global bucket across every workspace — from
+* `globalState`, but only when LEARNING_EXERCISES.md's task-link markers name
+* the same tasks, since relative paths alone collide across projects. Legacy
+* keys are cleared only after a successful migration, so the rightful
+* workspace can still claim global state later.
 *
 * @param context VS Code extension context.
 * @param wsRoot Workspace root URI.
 */
-async function ensureWorkspaceStorageDir(context: vscode.ExtensionContext, wsRoot: vscode.Uri): Promise<string> {
-  const dir = path.join(context.globalStorageUri.fsPath, "workspaces", workspaceStorageKey(wsRoot));
-  await fsp.mkdir(dir, { recursive: true });
-  return dir;
-}
+async function migrateLegacyScaffoldState(
+  context: vscode.ExtensionContext,
+  wsRoot: vscode.Uri
+): Promise<boolean> {
+  if (hasStateFile(wsRoot.fsPath)) { return false; }
 
-/**
-* Deletes all but the newest `keep` entries of a directory of timestamped
-* outputs. ISO-timestamp names sort lexicographically, so a plain sort is
-* chronological.
-*
-* @param dir Directory containing timestamped files/folders.
-* @param keep Number of newest entries to retain.
-*/
-async function pruneTimestampedOutputs(dir: string, keep: number): Promise<void> {
-  let entries: string[];
-  try {
-    entries = await fsp.readdir(dir);
-  } catch {
-    return;
-  }
-  const stale = entries.sort().slice(0, Math.max(0, entries.length - keep));
-  for (const name of stale) {
-    try {
-      await fsp.rm(path.join(dir, name), { recursive: true, force: true });
-    } catch {
-      // best-effort cleanup
+  const root = wsRoot.fsPath;
+  let tasks = context.workspaceState.get<ScaffoldTask[]>(LEGACY_SCAFFOLD_TASKS_STATE_KEY) ?? [];
+  let fromGlobal = false;
+
+  if (tasks.length === 0) {
+    const globalTasks = context.globalState.get<ScaffoldTask[]>(LEGACY_SCAFFOLD_TASKS_STATE_KEY) ?? [];
+    if (globalTasks.length > 0 && (await exercisesFileNamesTasks(wsRoot, globalTasks))) {
+      tasks = globalTasks;
+      fromGlobal = true;
     }
   }
-}
 
-/**
-* Resolves the solution snapshot directory for the current workspace: the
-* stored pointer if it still exists, otherwise the newest snapshot found in
-* the workspace's private-output directory.
-*
-* @param context VS Code extension context.
-*/
-function getSolutionSnapshotDir(context: vscode.ExtensionContext): string | null {
-  const stored = context.workspaceState.get<string>(SNAPSHOT_DIR_STATE_KEY);
-  if (stored && fs.existsSync(stored)) { return stored; }
+  const read = <T,>(key: string): T | undefined =>
+    (fromGlobal ? context.globalState.get<T>(key) : context.workspaceState.get<T>(key));
 
-  const wsRoot = getWorkspaceRootUri();
-  if (!wsRoot) { return null; }
-  const solutionsDir = path.join(context.globalStorageUri.fsPath, "workspaces", workspaceStorageKey(wsRoot), "solutions");
-  try {
-    const entries = fs.readdirSync(solutionsDir).sort();
-    const latest = entries[entries.length - 1];
-    return latest ? path.join(solutionsDir, latest) : null;
-  } catch {
-    return null;
+  const snapshotDir =
+    read<string>(LEGACY_SNAPSHOT_DIR_STATE_KEY) ??
+    newestEntry(path.join(legacyWorkspaceStorageDir(context, wsRoot), "solutions"));
+  const answerKeyPath =
+    read<string>(LEGACY_ANSWER_KEY_PATH_STATE_KEY) ??
+    newestEntry(path.join(legacyWorkspaceStorageDir(context, wsRoot), "answer-keys"), (n) => n.endsWith(".md"));
+
+  const imageRoles = context.workspaceState.get<Record<string, ImageRole>>(LEGACY_IMAGE_ROLE_CACHE_KEY) ?? {};
+  const designAnalyses =
+    context.workspaceState.get<Record<string, DesignAnalysisRecord>>(LEGACY_DESIGN_CACHE_KEY) ?? {};
+
+  const hasAnything =
+    tasks.length > 0 ||
+    Object.keys(imageRoles).length > 0 ||
+    Object.keys(designAnalyses).length > 0 ||
+    !!snapshotDir ||
+    !!answerKeyPath;
+  if (!hasAnything) { return false; }
+
+  if (snapshotDir && fs.existsSync(snapshotDir)) {
+    await copyDirInto(snapshotDir, getSolutionsDir(root));
   }
-}
-
-/**
-* Resolves the latest answer key for the current workspace: the stored
-* pointer if it still exists, otherwise the newest key found in the
-* workspace's private-output directory.
-*
-* @param context VS Code extension context.
-*/
-function getLatestAnswerKeyPath(context: vscode.ExtensionContext): string | null {
-  const stored = context.workspaceState.get<string>(ANSWER_KEY_PATH_STATE_KEY);
-  if (stored && fs.existsSync(stored)) { return stored; }
-
-  const wsRoot = getWorkspaceRootUri();
-  if (!wsRoot) { return null; }
-  const keyDir = path.join(context.globalStorageUri.fsPath, "workspaces", workspaceStorageKey(wsRoot), "answer-keys");
-  try {
-    const entries = fs.readdirSync(keyDir).filter((name) => name.endsWith(".md")).sort();
-    const latest = entries[entries.length - 1];
-    return latest ? path.join(keyDir, latest) : null;
-  } catch {
-    return null;
+  if (answerKeyPath && fs.existsSync(answerKeyPath)) {
+    await fsp.mkdir(getAnswerKeysDir(root), { recursive: true });
+    await fsp.copyFile(answerKeyPath, path.join(getAnswerKeysDir(root), path.basename(answerKeyPath)));
   }
+
+  await writeScaffoldState(root, { ...emptyScaffoldState(), tasks, imageRoles, designAnalyses });
+
+  for (const key of [
+    LEGACY_SCAFFOLD_TASKS_STATE_KEY,
+    LEGACY_SNAPSHOT_DIR_STATE_KEY,
+    LEGACY_ANSWER_KEY_PATH_STATE_KEY,
+    LEGACY_IMAGE_ROLE_CACHE_KEY,
+    LEGACY_DESIGN_CACHE_KEY,
+  ]) {
+    await context.workspaceState.update(key, undefined);
+    if (fromGlobal) { await context.globalState.update(key, undefined); }
+  }
+
+  return true;
 }
 
 /**
-* One-time migration of scaffold state that older versions stored globally
-* (shared across every workspace). The legacy state is adopted into this
-* workspace's workspaceState only when the workspace's LEARNING_EXERCISES.md
-* task-link markers reference the same tasks — relative paths alone collide
-* across projects. Legacy keys are cleared only after a successful match, so
-* the rightful workspace can still claim them later.
+* Whether the workspace's LEARNING_EXERCISES.md task-link markers reference
+* any of `tasks`, used to decide whether globally-stored state belongs here.
 *
-* @param context VS Code extension context.
+* @param wsRoot Workspace root URI.
+* @param tasks Candidate tasks.
 */
-async function migrateLegacyGlobalScaffoldState(context: vscode.ExtensionContext): Promise<void> {
-  const legacyTasks = context.globalState.get<ScaffoldTask[]>(SCAFFOLD_TASKS_STATE_KEY);
-  if (!legacyTasks || legacyTasks.length === 0) { return; }
-
-  const wsRoot = getWorkspaceRootUri();
-  if (!wsRoot) { return; }
-
-  // Never clobber state this workspace already owns.
-  if ((context.workspaceState.get<ScaffoldTask[]>(SCAFFOLD_TASKS_STATE_KEY) ?? []).length > 0) { return; }
-
+async function exercisesFileNamesTasks(wsRoot: vscode.Uri, tasks: ScaffoldTask[]): Promise<boolean> {
   let content: string;
   try {
     const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(wsRoot, "LEARNING_EXERCISES.md"));
     content = Buffer.from(bytes).toString("utf8");
   } catch {
-    return;
+    return false;
   }
 
-  const markerKeys = new Set<string>();
-  for (const m of content.matchAll(/<!-- LC_TASK_LINK\|([^|]+)\|([^>]+) -->/g)) {
-    markerKeys.add(getTaskStateKey(m[1].trim(), m[2].trim()));
-  }
-  if (markerKeys.size === 0) { return; }
+  const markerKeys = listMarkedTaskKeys(content);
+  if (markerKeys.size === 0) { return false; }
 
-  const matchesWorkspace = legacyTasks.some((task) => {
+  return tasks.some((task) => {
     try {
       return markerKeys.has(getTaskStateKey(normalizeRelativePath(task.path), task.id));
     } catch {
       return false;
     }
   });
-  if (!matchesWorkspace) { return; }
-
-  await context.workspaceState.update(SCAFFOLD_TASKS_STATE_KEY, legacyTasks);
-  const legacySnapshotDir = context.globalState.get<string>(SNAPSHOT_DIR_STATE_KEY);
-  if (legacySnapshotDir && fs.existsSync(legacySnapshotDir)) {
-    await context.workspaceState.update(SNAPSHOT_DIR_STATE_KEY, legacySnapshotDir);
-  }
-  const legacyKeyPath = context.globalState.get<string>(ANSWER_KEY_PATH_STATE_KEY);
-  if (legacyKeyPath && fs.existsSync(legacyKeyPath)) {
-    await context.workspaceState.update(ANSWER_KEY_PATH_STATE_KEY, legacyKeyPath);
-  }
-  await context.globalState.update(SCAFFOLD_TASKS_STATE_KEY, undefined);
-  await context.globalState.update(SNAPSHOT_DIR_STATE_KEY, undefined);
-  await context.globalState.update(ANSWER_KEY_PATH_STATE_KEY, undefined);
 }
 
 async function showCopilotCliDetails(context: vscode.ExtensionContext): Promise<void> {
@@ -742,6 +803,9 @@ const IGNORED_DIR_NAMES = new Set([
   "bin", "obj", "coverage", ".next", ".nuxt", ".svelte-kit", ".parcel-cache",
   ".turbo", ".cache", "vendor", "__pycache__", ".venv", "venv", ".tox",
   ".idea", ".vscode-test", ".pytest_cache", ".mypy_cache", ".gradle",
+  // Learning Copilot's own state: sending the solution snapshot back to the
+  // model as workspace context would hand it every masked answer.
+  STATE_DIR_NAME,
 ]);
 
 /** Lockfiles are large and near-useless as model context. */
@@ -1098,20 +1162,10 @@ async function detectPromptWorkflowMode(wsRoot: vscode.Uri): Promise<PromptWorkf
   return "create";
 }
 
-type TaskJumpLink = {
-  id: string;
-  rel: string;
-  line: number;
-  uri: string;
-};
-
 type TaskJumpTarget = {
   path: string;
   line: number;
 };
-
-const TASK_LINKS_START = "<!-- LC_TASK_LINKS_START -->";
-const TASK_LINKS_END = "<!-- LC_TASK_LINKS_END -->";
 
 /**
 * Collects a limited snapshot of workspace files to provide the model with context.
@@ -1193,93 +1247,37 @@ async function collectWorkspaceContext(wsRoot: vscode.Uri, output: vscode.Output
   return results;
 }
 
-function buildTaskJumpLinks(wsRoot: vscode.Uri, plan: ScaffoldPlan): TaskJumpLink[] {
-  const maskedByRel = new Map<string, string>();
-  for (const mf of plan.maskedFiles) {
-    try {
-      maskedByRel.set(normalizeRelativePath(mf.path), mf.content);
-    } catch {
-      // ignore invalid paths
-    }
+/**
+* Resolves a task link's `path` parameter against the workspace. Relative
+* paths are the current format; absolute paths appear only in exercises files
+* written by older versions and are accepted only while they still point
+* inside this workspace.
+*
+* @param wsRoot Workspace root URI.
+* @param pathParam Raw `path` query parameter.
+*/
+function resolveTaskLinkPath(wsRoot: vscode.Uri, pathParam: string): vscode.Uri | null {
+  if (path.isAbsolute(pathParam)) {
+    const rel = path.relative(wsRoot.fsPath, pathParam);
+    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) { return null; }
+    return vscode.Uri.file(pathParam);
   }
-
-  const links: TaskJumpLink[] = [];
-  for (const task of plan.tasks) {
-    let rel: string;
-    try {
-      rel = normalizeRelativePath(task.path);
-    } catch {
-      continue;
-    }
-
-    const content = maskedByRel.get(rel);
-    if (!content) { continue; }
-
-    const regions = listTaskRegions(content);
-    const region = regions.find((r) => r.id === task.id);
-    if (!region) { continue; }
-
-    const line = getRegionStartLine(content, region.startTokenStart);
-    const fileUri = vscode.Uri.joinPath(wsRoot, ...rel.split("/"));
-    const query = new URLSearchParams({ path: fileUri.fsPath, line: String(line) }).toString();
-    const uri = `vscode://${EXTENSION_URI_ID}/openTaskLink?${query}`;
-    links.push({ id: task.id, rel, line, uri });
+  try {
+    return vscode.Uri.joinPath(wsRoot, ...normalizeRelativePath(pathParam).split("/"));
+  } catch {
+    return null;
   }
-
-  links.sort((a, b) => a.rel.localeCompare(b.rel) || a.line - b.line || a.id.localeCompare(b.id));
-  return links;
 }
 
-function getTaskStateKey(rel: string, id: string): string {
-  return `${rel}::${id}`;
-}
-
-function getCompletedTaskKeySet(tasks: ScaffoldTask[]): Set<string> {
-  const out = new Set<string>();
-  for (const task of tasks) {
-    if (!task.completed) { continue; }
-    try {
-      out.add(getTaskStateKey(normalizeRelativePath(task.path), task.id));
-    } catch {
-      // ignore invalid paths
-    }
-  }
-  return out;
-}
-
-function buildTaskLinksSection(links: TaskJumpLink[], completed: Set<string>): string {
-  const lines = [
-    "# Task Links",
-    "",
-    ...links.map((link) => {
-      const checked = completed.has(getTaskStateKey(link.rel, link.id)) ? "x" : " ";
-      return `- [${checked}] **${link.id}**: [${link.rel}:${link.line}](${link.uri}) <!-- LC_TASK_LINK|${link.rel}|${link.id} -->`;
-    }),
-    "",
-  ];
-
-  return [TASK_LINKS_START, ...lines, TASK_LINKS_END].join("\n");
-}
-
-function prependTaskLinksSection(exercisesMd: string, links: TaskJumpLink[], tasks: ScaffoldTask[]): string {
-  if (links.length === 0) { return exercisesMd; }
-
-  const block = buildTaskLinksSection(links, getCompletedTaskKeySet(tasks));
-  return `${block}\n\n---\n\n${exercisesMd}`;
-}
-
-function refreshTaskLinksSection(content: string, completed: Set<string>): string {
-  const re = /^- \[[ x]\] \*\*([^*]+)\*\*: \[[^\]]+\]\([^)]+\) <!-- LC_TASK_LINK\|([^|]+)\|([^>]+) -->$/gm;
-  return content.replace(re, (_full, _displayId, rel, id) => {
-    const checked = completed.has(getTaskStateKey(rel, id)) ? "x" : " ";
-    return _full.replace(/^(- \[)[ x](\])/, `$1${checked}$2`);
-  });
-}
-
-async function syncLearningExercisesTaskStatuses(
-  context: vscode.ExtensionContext,
-  wsRoot: vscode.Uri
-): Promise<void> {
+/**
+* Brings LEARNING_EXERCISES.md's Task Links block back in line with stored
+* state: completion checkboxes, and link URIs that may still carry the
+* absolute paths written by older versions. Writes only when something
+* actually changes.
+*
+* @param wsRoot Workspace root URI.
+*/
+async function syncLearningExercisesTaskLinks(wsRoot: vscode.Uri): Promise<void> {
   const targetUri = vscode.Uri.joinPath(wsRoot, "LEARNING_EXERCISES.md");
   let bytes: Uint8Array;
   try {
@@ -1293,10 +1291,7 @@ async function syncLearningExercisesTaskStatuses(
     return;
   }
 
-  const updated = refreshTaskLinksSection(
-    content,
-    getCompletedTaskKeySet(context.workspaceState.get<ScaffoldTask[]>(SCAFFOLD_TASKS_STATE_KEY) ?? [])
-  );
+  const updated = refreshTaskLinksSection(content, getCompletedTaskKeySet(getScaffoldTasks()));
   if (updated === content) {
     return;
   }
@@ -1304,28 +1299,25 @@ async function syncLearningExercisesTaskStatuses(
   await vscode.workspace.fs.writeFile(targetUri, Buffer.from(updated, "utf8"));
 }
 
-async function markTasksCompleted(
-  context: vscode.ExtensionContext,
-  wsRoot: vscode.Uri,
-  taskKeys: string[]
-): Promise<void> {
+async function markTasksCompleted(wsRoot: vscode.Uri, taskKeys: string[]): Promise<void> {
   if (taskKeys.length === 0) { return; }
 
   const keys = new Set(taskKeys);
-  const all = context.workspaceState.get<ScaffoldTask[]>(SCAFFOLD_TASKS_STATE_KEY) ?? [];
-  const updated = all.map((task) => {
-    try {
-      const rel = normalizeRelativePath(task.path);
-      if (keys.has(getTaskStateKey(rel, task.id))) {
-        return { ...task, completed: true };
+  await updateScaffoldState(wsRoot, (state) => ({
+    ...state,
+    tasks: state.tasks.map((task) => {
+      try {
+        const rel = normalizeRelativePath(task.path);
+        if (keys.has(getTaskStateKey(rel, task.id))) {
+          return { ...task, completed: true };
+        }
+      } catch {
+        // ignore invalid paths
       }
-    } catch {
-      // ignore invalid paths
-    }
-    return task;
-  });
-  await context.workspaceState.update(SCAFFOLD_TASKS_STATE_KEY, updated);
-  await syncLearningExercisesTaskStatuses(context, wsRoot);
+      return task;
+    }),
+  }));
+  await syncLearningExercisesTaskLinks(wsRoot);
 }
 
 function pickTaskLinkViewColumn(): vscode.ViewColumn {
@@ -1558,9 +1550,8 @@ function getRelPathForActiveDoc(wsRoot: vscode.Uri, docUri: vscode.Uri): string 
   return normalizeRelativePath(rel);
 }
 
-function getTaskById(context: vscode.ExtensionContext, rel: string, id: string): ScaffoldTask | null {
-  const all = context.workspaceState.get<ScaffoldTask[]>(SCAFFOLD_TASKS_STATE_KEY) ?? [];
-  for (const b of all) {
+function getTaskById(rel: string, id: string): ScaffoldTask | null {
+  for (const b of getScaffoldTasks()) {
     try {
       if (normalizeRelativePath(b.path) === rel && b.id === id && !b.completed) { return b; }
     } catch {}
@@ -1568,17 +1559,14 @@ function getTaskById(context: vscode.ExtensionContext, rel: string, id: string):
   return null;
 }
 
-async function restoreAllTasksInWorkspace(
-  context: vscode.ExtensionContext,
-  wsRoot: vscode.Uri
-): Promise<{
+async function restoreAllTasksInWorkspace(wsRoot: vscode.Uri): Promise<{
   filesUpdated: number;
   tasksApplied: number;
   appliedTaskKeys: string[];
   missingFiles: string[];
   missingMappings: string[];
 }> {
-  const allTasks = context.workspaceState.get<ScaffoldTask[]>(SCAFFOLD_TASKS_STATE_KEY) ?? [];
+  const allTasks = getScaffoldTasks();
   if (allTasks.length === 0) {
     return { filesUpdated: 0, tasksApplied: 0, appliedTaskKeys: [], missingFiles: [], missingMappings: [] };
   }
@@ -1656,29 +1644,6 @@ async function restoreAllTasksInWorkspace(
 * transport, apply a file plan, run the deterministic scaffold pipeline, and
 * persist its outputs.
 */
-
-/**
-* Saves a snapshot of the solution files to a timestamped folder in extension storage, and returns the root path of the saved snapshot.
-* @param storageDir Extension storage directory.
-* @param written List of files with relative paths and full content to save as the solution snapshot.
-* @return The root path of the saved solution snapshot.
-*/
-async function saveSolutionSnapshot(storageDir: string, written: WrittenFile[]): Promise<string> {
-  const ts = new Date().toISOString().replace(/[:.]/g, "-");
-  const solutionsDir = path.join(storageDir, "solutions");
-  const root = path.join(solutionsDir, `solution-${ts}`);
-  await fsp.mkdir(root, { recursive: true });
-
-  for (const f of written) {
-    const rel = normalizeRelativePath(f.rel);
-    const abs = path.join(root, ...rel.split("/"));
-    await fsp.mkdir(path.dirname(abs), { recursive: true });
-    await fsp.writeFile(abs, f.fullContent, "utf8");
-  }
-
-  await pruneTimestampedOutputs(solutionsDir, PRIVATE_OUTPUTS_KEEP);
-  return root;
-}
 
 function buildScaffoldContextFromWorkspaceSnapshot(
   wsSnapshot: WorkspaceFileContext[],
@@ -2159,18 +2124,17 @@ async function runScaffoldGeneration(args: {
 * files this run wrote), exercises markdown, and the private answer key.
 */
 async function persistScaffoldOutputs(args: {
-  context: vscode.ExtensionContext;
   wsRoot: vscode.Uri;
   scaffold: ScaffoldPlan;
   allowedRels: Set<string>;
   output: vscode.OutputChannel;
 }): Promise<void> {
-  const { context, wsRoot, scaffold, allowedRels, output } = args;
+  const { wsRoot, scaffold, allowedRels, output } = args;
 
-  await context.workspaceState.update(
-    SCAFFOLD_TASKS_STATE_KEY,
-    scaffold.tasks.map((task) => ({ ...task, completed: false }))
-  );
+  await updateScaffoldState(wsRoot, (state) => ({
+    ...state,
+    tasks: scaffold.tasks.map((task) => ({ ...task, completed: false })),
+  }));
 
   if (scaffold.notes) {
     output.appendLine("--- scaffold notes ---");
@@ -2213,22 +2177,15 @@ async function persistScaffoldOutputs(args: {
   // Write exercises markdown into workspace
   const exercisesWithLinks = prependTaskLinksSection(
     scaffold.exercisesMd,
-    buildTaskJumpLinks(wsRoot, scaffold),
+    buildTaskJumpLinks(scaffold),
     scaffold.tasks
   );
   await writeWorkspaceMarkdownWithPrompt(wsRoot, "LEARNING_EXERCISES.md", exercisesWithLinks, "Learning tasks");
 
-  // Save instructor answer key privately
+  // Save the answer key alongside the project so it travels with a copy.
   if (scaffold.answerKeyMd) {
     try {
-      const ts = new Date().toISOString().replace(/[:.]/g, "-");
-      const keyDir = path.join(await ensureWorkspaceStorageDir(context, wsRoot), "answer-keys");
-      await fsp.mkdir(keyDir, { recursive: true });
-      const keyPath = path.join(keyDir, `answer-key-${ts}.md`);
-      await fsp.writeFile(keyPath, scaffold.answerKeyMd, "utf8");
-      await pruneTimestampedOutputs(keyDir, PRIVATE_OUTPUTS_KEEP);
-      await context.workspaceState.update(ANSWER_KEY_PATH_STATE_KEY, keyPath);
-      vscode.window.showInformationMessage(`Instructor answer key saved to extension storage: ${keyPath}`);
+      await writeAnswerKey(wsRoot.fsPath, scaffold.answerKeyMd);
       vscode.window.showInformationMessage("Use 'Learning Copilot: Open Latest Answer Key' to view comprehension answers.");
     } catch (e: any) {
       output.appendLine(`Failed to save answer key: ${e?.message ?? String(e)}`);
@@ -2281,16 +2238,10 @@ const MAX_CONTENT_ASSETS = 100;
 const MAX_DESIGN_ASSET_BYTES = 20_000_000;
 /** The Language Model API caps image data parts at 5MB. */
 const MAX_LM_IMAGE_BYTES = 5_000_000;
-const DESIGN_CACHE_KEY = "learningCopilot.designAnalyses";
-const IMAGE_ROLE_CACHE_KEY = "learningCopilot.imageRoles";
 const DESIGN_NOTES_FILENAME = "LEARNING_DESIGNS.md";
 
-type DesignAnalysisRecord = { hash: string; analyzedAt: string; analysisMd: string };
 type DesignAnalysis = { path: string; analysisMd: string };
 type DesignAsset = { rel: string; uri: vscode.Uri; mimeType: string };
-
-/** How an image participates: studied by the model, or used by the site. */
-type ImageRole = "design" | "asset";
 
 /** Manifest entry describing a content asset to the model (no vision call). */
 type ImageAssetInfo = {
@@ -2376,10 +2327,7 @@ async function readImageDimensions(
 * Folder conventions decide most files; anything ambiguous triggers a
 * one-time multi-select prompt whose answers are remembered per file.
 */
-async function discoverWorkspaceImages(
-  context: vscode.ExtensionContext,
-  wsRoot: vscode.Uri
-): Promise<WorkspaceImages> {
+async function discoverWorkspaceImages(wsRoot: vscode.Uri): Promise<WorkspaceImages> {
   const exclude = getWorkspaceScanExcludeGlob();
   const uris = await vscode.workspace.findFiles("**/*", exclude, 2000);
 
@@ -2405,9 +2353,7 @@ async function discoverWorkspaceImages(
   candidates.sort((a, b) => a.rel.localeCompare(b.rel));
 
   // Remembered answers for images whose location doesn't classify them.
-  const roles = {
-    ...(context.workspaceState.get<Record<string, ImageRole>>(IMAGE_ROLE_CACHE_KEY) ?? {}),
-  };
+  const roles = { ...getScaffoldState().imageRoles };
   const present = new Set(candidates.map((c) => c.rel));
   for (const rel of Object.keys(roles)) {
     if (!present.has(rel)) { delete roles[rel]; }
@@ -2432,7 +2378,7 @@ async function discoverWorkspaceImages(
     }
     // On cancel: treat as assets for this run only, without remembering.
   }
-  await context.workspaceState.update(IMAGE_ROLE_CACHE_KEY, roles);
+  await updateScaffoldState(wsRoot, (state) => ({ ...state, imageRoles: roles }));
 
   const designDocs: DesignAsset[] = [];
   const contentAssets: ImageAssetInfo[] = [];
@@ -2530,7 +2476,6 @@ async function writeDesignNotesFile(
 * analyses (cached + fresh) plus how many were (re)analyzed now.
 */
 async function ensureDesignAnalyses(args: {
-  context: vscode.ExtensionContext;
   wsRoot: vscode.Uri;
   runtime: LlmRuntime;
   output: vscode.OutputChannel;
@@ -2538,11 +2483,9 @@ async function ensureDesignAnalyses(args: {
   force?: boolean;
   report?: (message: string) => void;
 }): Promise<{ analyses: DesignAnalysis[]; analyzedCount: number }> {
-  const { context, wsRoot, runtime, output, assets, force, report } = args;
+  const { wsRoot, runtime, output, assets, force, report } = args;
 
-  const cache = {
-    ...(context.workspaceState.get<Record<string, DesignAnalysisRecord>>(DESIGN_CACHE_KEY) ?? {}),
-  };
+  const cache: Record<string, DesignAnalysisRecord> = { ...getScaffoldState().designAnalyses };
 
   // Drop cache entries for files that no longer exist.
   const present = new Set(assets.map((a) => a.rel));
@@ -2550,8 +2493,11 @@ async function ensureDesignAnalyses(args: {
     if (!present.has(rel)) { delete cache[rel]; }
   }
 
+  const persistCache = () =>
+    updateScaffoldState(wsRoot, (state) => ({ ...state, designAnalyses: { ...cache } }));
+
   if (assets.length === 0) {
-    await context.workspaceState.update(DESIGN_CACHE_KEY, cache);
+    await persistCache();
     return { analyses: [], analyzedCount: 0 };
   }
 
@@ -2638,7 +2584,7 @@ async function ensureDesignAnalyses(args: {
       }
       cache[asset.rel] = { hash, analyzedAt: new Date().toISOString(), analysisMd };
       analyzedCount++;
-      await context.workspaceState.update(DESIGN_CACHE_KEY, cache);
+      await persistCache();
     } catch (e: any) {
       output.appendLine(`[design] Failed to analyze ${asset.rel}: ${e?.message ?? String(e)}`);
       vscode.window.showWarningMessage(
@@ -2647,7 +2593,7 @@ async function ensureDesignAnalyses(args: {
     }
   }
 
-  await context.workspaceState.update(DESIGN_CACHE_KEY, cache);
+  await persistCache();
 
   const analyses: DesignAnalysis[] = assets
     .filter((a) => cache[a.rel])
@@ -2814,13 +2760,40 @@ export async function activate(context: vscode.ExtensionContext) {
   const output = vscode.window.createOutputChannel("Learning Copilot");
   context.subscriptions.push(output);
 
-  // Adopt scaffold state that older versions stored globally, if it belongs
-  // to this workspace.
-  try {
-    await migrateLegacyGlobalScaffoldState(context);
-  } catch (e: any) {
-    output.appendLine(`Legacy scaffold state migration skipped: ${e?.message ?? String(e)}`);
+  // Load this workspace's scaffold state, first adopting anything left behind
+  // by versions that stored it outside the workspace, then repairing task
+  // links that older versions wrote as absolute paths.
+  const initialRoot = getWorkspaceRootUri();
+  if (initialRoot) {
+    try {
+      if (await migrateLegacyScaffoldState(context, initialRoot)) {
+        output.appendLine(`Migrated Learning Copilot state into ${STATE_DIR_NAME}/.`);
+      }
+    } catch (e: any) {
+      output.appendLine(`Legacy scaffold state migration skipped: ${e?.message ?? String(e)}`);
+    }
+    await loadScaffoldState(initialRoot);
+    try {
+      await syncLearningExercisesTaskLinks(initialRoot);
+    } catch (e: any) {
+      output.appendLine(`Could not refresh task links: ${e?.message ?? String(e)}`);
+    }
   }
+
+  // Reload state when the open folder changes.
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(async () => {
+      const wsRoot = getWorkspaceRootUri();
+      if (!wsRoot) { return; }
+      try {
+        await migrateLegacyScaffoldState(context, wsRoot);
+        await loadScaffoldState(wsRoot);
+        await syncLearningExercisesTaskLinks(wsRoot);
+      } catch (e: any) {
+        output.appendLine(`Could not load scaffold state: ${e?.message ?? String(e)}`);
+      }
+    })
+  );
 
   // Always-visible entry point: opens the Learning Copilot menu.
   menuStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 101);
@@ -2902,20 +2875,11 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.workspace.registerTextDocumentContentProvider(SOLUTION_SCHEME, {
       provideTextDocumentContent(uri: vscode.Uri): string {
         const rel = uri.path.replace(/^\/+/, "");
-        const snapshotDir = getSolutionSnapshotDir(context);
-        if (!snapshotDir) {
+        const wsRoot = getWorkspaceRootUri();
+        if (!wsRoot || !hasSolutionSnapshot(wsRoot.fsPath)) {
           return "(No solution snapshot available yet. Generate code files and enable scaffold generation.)\n";
         }
-        try {
-          const safeRel = normalizeRelativePath(rel);
-          const abs = path.join(snapshotDir, ...safeRel.split("/"));
-          if (!fs.existsSync(abs)) {
-            return `(Solution snapshot does not contain: ${safeRel})\n`;
-          }
-          return fs.readFileSync(abs, "utf8");
-        } catch (e: any) {
-          return `(Failed to load solution snapshot for ${rel}: ${e?.message ?? String(e)})\n`;
-        }
+        return readSolutionFile(wsRoot.fsPath, rel) ?? `(Solution snapshot does not contain: ${rel})\n`;
       },
     })
   );
@@ -2950,8 +2914,20 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
 
+      const wsRoot = getWorkspaceRootUri();
+      if (!wsRoot) {
+        return vscode.window.showErrorMessage("Open a folder/workspace first.");
+      }
+
+      const uri = resolveTaskLinkPath(wsRoot, target.path);
+      if (!uri) {
+        return vscode.window.showErrorMessage(
+          `This task link points outside the current workspace (${target.path}). ` +
+          "It was written by an older version of Learning Copilot; reopen the folder to have the links repaired."
+        );
+      }
+
       try {
-        const uri = vscode.Uri.file(target.path);
         const doc = await vscode.workspace.openTextDocument(uri);
         const line = Math.max(0, target.line - 1);
         const pos = new vscode.Position(line, 0);
@@ -3143,7 +3119,7 @@ export async function activate(context: vscode.ExtensionContext) {
       let designAnalyses: DesignAnalysis[] = [];
       let imageAssets: ImageAssetInfo[] = [];
       try {
-        const images = await discoverWorkspaceImages(context, wsRoot);
+        const images = await discoverWorkspaceImages(wsRoot);
         imageAssets = images.contentAssets;
         const designResult = await vscode.window.withProgress(
           {
@@ -3153,8 +3129,7 @@ export async function activate(context: vscode.ExtensionContext) {
           },
           async (progress) =>
             ensureDesignAnalyses({
-              context,
-              wsRoot,
+                            wsRoot,
               runtime,
               output,
               assets: images.designDocs,
@@ -3271,11 +3246,10 @@ export async function activate(context: vscode.ExtensionContext) {
       );
       if (doScaffold !== "Generate") { return; }
 
-      // Save full solution snapshot privately
+      // Save the full solution snapshot alongside the project.
       let snapshotDir: string | null = null;
       try {
-        snapshotDir = await saveSolutionSnapshot(await ensureWorkspaceStorageDir(context, wsRoot), writtenFiles);
-        await context.workspaceState.update(SNAPSHOT_DIR_STATE_KEY, snapshotDir);
+        snapshotDir = await writeSolutionSnapshot(wsRoot.fsPath, writtenFiles);
       } catch (e: any) {
         output.appendLine(`Failed to save solution snapshot: ${e?.message ?? String(e)}`);
       }
@@ -3304,7 +3278,6 @@ export async function activate(context: vscode.ExtensionContext) {
 
       const generatedSet = new Set(writtenFiles.map((w) => normalizeRelativePath(w.rel)));
       await persistScaffoldOutputs({
-        context,
         wsRoot,
         scaffold,
         allowedRels: generatedSet,
@@ -3312,7 +3285,7 @@ export async function activate(context: vscode.ExtensionContext) {
       });
 
       if (snapshotDir) {
-        vscode.window.showInformationMessage(`Full solution snapshot saved to extension storage: ${snapshotDir}`);
+        output.appendLine(`Full solution snapshot saved to ${STATE_DIR_NAME}/solutions.`);
       }
 
       vscode.window.showInformationMessage("Learning Copilot: Scaffold generation complete.");
@@ -3327,17 +3300,16 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      const snapshotDir = getSolutionSnapshotDir(context);
-      if (!snapshotDir) {
-        vscode.window.showWarningMessage(
-          "No solution snapshot available yet. Run ‘Learning Copilot: Create or Update Project from Prompt’ and generate learning tasks first."
-        );
-        return;
-      }
-
       const wsRoot = getWorkspaceRootUri();
       if (!wsRoot) {
         vscode.window.showErrorMessage("Open a folder/workspace first.");
+        return;
+      }
+
+      if (!hasSolutionSnapshot(wsRoot.fsPath)) {
+        vscode.window.showWarningMessage(
+          "No solution snapshot available yet. Run ‘Learning Copilot: Create or Update Project from Prompt’ and generate learning tasks first."
+        );
         return;
       }
 
@@ -3382,7 +3354,7 @@ export async function activate(context: vscode.ExtensionContext) {
         );
       }
 
-      const task = getTaskById(context, rel, hit.id);
+      const task = getTaskById(rel, hit.id);
       if (!task) { return vscode.window.showErrorMessage(`No stored solution mapping for task id: ${hit.id}`); }
 
       // Ensure the END marker stays on its own line.
@@ -3391,7 +3363,7 @@ export async function activate(context: vscode.ExtensionContext) {
       const insert = task.solution.endsWith("\n") ? task.solution : task.solution + "\n";
 
       await applySolutionForRegion(editor, editor.document, hit, insert, true);
-      await markTasksCompleted(context, wsRoot, [getTaskStateKey(rel, hit.id)]);
+      await markTasksCompleted(wsRoot, [getTaskStateKey(rel, hit.id)]);
       vscode.window.showInformationMessage(`Applied solution for task ${hit.id} (markers removed).`);
     })
   );
@@ -3412,14 +3384,14 @@ export async function activate(context: vscode.ExtensionContext) {
       const offset = editor.document.offsetAt(editor.selection.active);
       const next = findNextTaskRegion(text, offset);
       if (!next) { return vscode.window.showInformationMessage("No further task regions found in this file."); }
-      const task = getTaskById(context, rel, next.id);
+      const task = getTaskById(rel, next.id);
       if (!task) {return vscode.window.showErrorMessage(`No stored solution mapping for task id: ${next.id}`);}
       const insert = task.solution.endsWith("\n") ? task.solution : task.solution + "\n";
       const insertLen = insert.length;
       const newPos = editor.document.positionAt(next.startTokenEnd + insertLen);
 
       await applySolutionForRegion(editor, editor.document, next, insert, true);
-      await markTasksCompleted(context, wsRoot, [getTaskStateKey(rel, next.id)]);
+      await markTasksCompleted(wsRoot, [getTaskStateKey(rel, next.id)]);
 
       editor.selection = new vscode.Selection(newPos, newPos);
       editor.revealRange(new vscode.Range(newPos, newPos));
@@ -3433,7 +3405,7 @@ export async function activate(context: vscode.ExtensionContext) {
       const wsRoot = getWorkspaceRootUri();
       if (!wsRoot) { return vscode.window.showErrorMessage("Open a folder/workspace first."); }
 
-      const allTasks = context.workspaceState.get<ScaffoldTask[]>(SCAFFOLD_TASKS_STATE_KEY) ?? [];
+      const allTasks = getScaffoldTasks();
       if (allTasks.length === 0) {
         return vscode.window.showInformationMessage("No learning tasks are stored yet.");
       }
@@ -3450,12 +3422,12 @@ export async function activate(context: vscode.ExtensionContext) {
           cancellable: false,
         },
         async () => {
-          const result = await restoreAllTasksInWorkspace(context, wsRoot);
+          const result = await restoreAllTasksInWorkspace(wsRoot);
           filesUpdated = result.filesUpdated;
           tasksApplied = result.tasksApplied;
           missingFiles.push(...result.missingFiles);
           missingMappings.push(...result.missingMappings);
-          await markTasksCompleted(context, wsRoot, result.appliedTaskKeys);
+          await markTasksCompleted(wsRoot, result.appliedTaskKeys);
         }
       );
 
@@ -3503,7 +3475,7 @@ export async function activate(context: vscode.ExtensionContext) {
           "No __LC_TASK_<id>_START__/__LC_TASK_<id>_END__ region under the cursor."
         );
       }
-      const task = getTaskById(context, rel, hit.id);
+      const task = getTaskById(rel, hit.id);
       if (!task) { return vscode.window.showErrorMessage(`No stored mapping for task id: ${hit.id}`); }
 
       const parts: string[] = [];
@@ -3604,7 +3576,7 @@ export async function activate(context: vscode.ExtensionContext) {
         .forEach((e) => eb.replace(e.range, e.replacement));
       });
 
-      await markTasksCompleted(context, wsRoot, [getTaskStateKey(rel, hit.id)]);
+      await markTasksCompleted(wsRoot, [getTaskStateKey(rel, hit.id)]);
 
       vscode.window.showInformationMessage(`Marked task as done: ${hit.id}`);
     })
@@ -3613,7 +3585,13 @@ export async function activate(context: vscode.ExtensionContext) {
   // Open latest instructor answer key (includes comprehension answers)
   context.subscriptions.push(
     vscode.commands.registerCommand("learningCopilot.openLatestAnswerKey", async () => {
-      const keyPath = getLatestAnswerKeyPath(context);
+      const wsRoot = getWorkspaceRootUri();
+      if (!wsRoot) {
+        vscode.window.showErrorMessage("Open a folder/workspace first.");
+        return;
+      }
+
+      const keyPath = getLatestAnswerKeyPath(wsRoot.fsPath);
       if (!keyPath) {
         vscode.window.showWarningMessage(
           "No instructor answer key saved yet. Generate learning tasks with an answer key first."
@@ -3643,7 +3621,7 @@ export async function activate(context: vscode.ExtensionContext) {
         async (progress) => {
           const modifyStartedAt = Date.now();
           try {
-            const allTasks = context.workspaceState.get<ScaffoldTask[]>(SCAFFOLD_TASKS_STATE_KEY) ?? [];
+            const allTasks = getScaffoldTasks();
             const remainingTasks = allTasks.filter((task) => !task.completed);
             if (remainingTasks.length > 0) {
               const choice = await vscode.window.showWarningMessage(
@@ -3657,7 +3635,7 @@ export async function activate(context: vscode.ExtensionContext) {
             }
 
             reportActivity(progress, output, modifyStartedAt, "Step 1/5: Restoring solved workspace from existing tasks…", "Step 1/5: Restoring solved workspace");
-            const restoreResult = await restoreAllTasksInWorkspace(context, wsRoot);
+            const restoreResult = await restoreAllTasksInWorkspace(wsRoot);
             if (restoreResult.missingMappings.length > 0) {
               vscode.window.showErrorMessage(
                 `Could not restore some task regions before modifying the workspace: ${restoreResult.missingMappings.join(" | ")}`
@@ -3702,11 +3680,10 @@ export async function activate(context: vscode.ExtensionContext) {
             let designAnalyses: DesignAnalysis[] = [];
             let imageAssets: ImageAssetInfo[] = [];
             try {
-              const images = await discoverWorkspaceImages(context, wsRoot);
+              const images = await discoverWorkspaceImages(wsRoot);
               imageAssets = images.contentAssets;
               const designResult = await ensureDesignAnalyses({
-                context,
-                wsRoot,
+                                wsRoot,
                 runtime,
                 output,
                 assets: images.designDocs,
@@ -3786,11 +3763,10 @@ export async function activate(context: vscode.ExtensionContext) {
             }
 
             reportActivity(progress, output, modifyStartedAt, "Step 4/5: Preparing learning tasks for changed files…", "Step 4/5: Preparing tasks");
-            // Save full solution snapshot of the changed files (private)
+            // Merge the changed files into the project's solution snapshot.
             let snapshotDir: string | null = null;
             try {
-              snapshotDir = await saveSolutionSnapshot(await ensureWorkspaceStorageDir(context, wsRoot), writtenFiles);
-              await context.workspaceState.update(SNAPSHOT_DIR_STATE_KEY, snapshotDir);
+              snapshotDir = await writeSolutionSnapshot(wsRoot.fsPath, writtenFiles);
             } catch (e: any) {
               output.appendLine(`Failed to save solution snapshot: ${e?.message ?? String(e)}`);
             }
@@ -3841,7 +3817,6 @@ export async function activate(context: vscode.ExtensionContext) {
             reportActivity(progress, output, modifyStartedAt, "Step 5/5: Applying learning tasks…", "Step 5/5: Applying tasks");
             const changedSet = new Set(writtenFiles.map((w) => normalizeRelativePath(w.rel)));
             await persistScaffoldOutputs({
-              context,
               wsRoot,
               scaffold,
               allowedRels: changedSet,
@@ -3849,7 +3824,7 @@ export async function activate(context: vscode.ExtensionContext) {
             });
 
             if (snapshotDir) {
-              vscode.window.showInformationMessage(`Solution snapshot saved to extension storage: ${snapshotDir}`);
+              output.appendLine(`Solution snapshot saved to ${STATE_DIR_NAME}/solutions.`);
             }
 
             vscode.window.showInformationMessage("Learning Copilot: Workspace modification learning tasks complete.");
@@ -3938,7 +3913,7 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      const images = await discoverWorkspaceImages(context, wsRoot);
+      const images = await discoverWorkspaceImages(wsRoot);
       if (images.designDocs.length === 0) {
         vscode.window.showInformationMessage(
           images.contentAssets.length > 0
@@ -3962,8 +3937,7 @@ export async function activate(context: vscode.ExtensionContext) {
           },
           async (progress) =>
             ensureDesignAnalyses({
-              context,
-              wsRoot,
+                            wsRoot,
               runtime,
               output,
               assets: images.designDocs,

@@ -22,8 +22,8 @@ After code generation/modification, the extension scaffolds the result:
   for each file type — so marker formatting can't be wrong
 - solution mappings are saved per task id
 - learner instructions are written to `LEARNING_EXERCISES.md`
-- private artifacts (full solution snapshots + answer keys) are saved in
-  extension storage
+- task state, full solution snapshots and answer keys are saved in a
+  `.learning-copilot/` folder inside the project
 
 It also supports:
 
@@ -138,8 +138,21 @@ arrows, and Return.
 ## Output and Storage
 
 - Learner-facing exercises are written to `LEARNING_EXERCISES.md` in your workspace.
-- Full solution snapshots and answer keys are stored in extension global storage.
-- Compare uses the latest snapshot and currently active file.
+- Everything else lives in a `.learning-copilot/` folder in the same project:
+  - `state.json` — task solutions, hints, completion state, design analyses
+  - `solutions/` — full solution copies of every scaffolded file
+  - `answer-keys/` — the five most recent answer keys
+- Compare uses the solution snapshot and currently active file.
+
+Keeping state in the project means an exercise folder can be copied, renamed,
+moved, or zipped up and handed to someone else, and everything still works —
+task links, hints, Apply Task, Compare With Solution and the answer key. The
+trade is that the solutions are readable by a determined student; Compare With
+Solution and Open Latest Answer Key already put them a menu item away.
+
+`.learning-copilot/` is deliberately *not* added to `.gitignore`, so a project
+distributed by git carries its exercise state too. Add it yourself if you'd
+rather students committed only their own work.
 
 ## Development
 
@@ -165,7 +178,7 @@ To run locally in VS Code:
 
 - Requires Copilot CLI availability and authentication.
 - Scaffold quality depends on model output and prompt complexity.
-- Snapshot/answer-key state is per extension storage, not per git branch.
+- Snapshot/answer-key state is per project folder, not per git branch.
 
 ## License
 
