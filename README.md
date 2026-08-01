@@ -59,6 +59,56 @@ Run `Learning Copilot: Analyze Design Files` to analyze up front or refresh
 after editing a design. PDF analysis uses the Copilot CLI (the VS Code
 Language Model API only accepts images); images work on either transport.
 
+## Figma Variables
+
+`Learning Copilot: Import Figma Tokens` turns a Figma file's design system into
+CSS custom properties. It reads the real token graph through the Figma MCP
+server — collections, named modes and alias references all intact — rather than
+the flattened, selection-scoped view a chat prompt would get.
+
+The output follows the two-layer convention:
+
+- **Primitive tokens** (collections whose values are all fixed) become literals:
+  `--primitive-color-purple-700: #797596`.
+- **Semantic tokens** (collections that alias other tokens) become references:
+  `--color-primary: var(--primitive-color-purple-700)`.
+- **Modes** other than the default become overrides. Light and Dark map to
+  `prefers-color-scheme` automatically; for anything else you are asked once
+  whether the mode is a breakpoint, a colour scheme, or switched by a
+  `data-mode` attribute, and the answer is remembered. The import also reads
+  your top-level artboard sizes, so a `Tablet` mode offers `max-width: 768px`
+  when that is how wide the Tablet frame is — the breakpoint comes from the
+  design rather than from a guess.
+
+Which mode is the *default* — the one whose values sit in `:root` — cannot be
+guessed, since Figma's mode ordering is arbitrary. You are asked once per
+multi-mode collection.
+
+The first time you import, VS Code asks permission to run the extractor in
+Figma and shows you the whole script. That is expected — the script explains
+itself in a header comment, including why it deliberately finishes by throwing
+an error (Figma discards return values, so the results come back as error
+text). Nothing in your design is modified. To stop being asked every time, use
+`Chat: Manage Tool Approval` from the Command Palette and trust the Figma
+server's `use_figma` tool; avoid the blanket `chat.tools.autoApprove` setting,
+which approves everything else too. VS Code also starts the Figma MCP server on
+demand, so it does not need to be running beforehand.
+
+The conversion is a deterministic transform, not a prompt, so nothing is
+dropped or renamed in transit and the numbers can be checked: the emitted
+counts are cross-checked against the extractor's own. Tokens that cannot be
+converted are reported rather than skipped in silence — dangling aliases, alias
+loops (which would render the page unstyled with no browser error), and values
+that would break out of the stylesheet.
+
+**Importing is the metered step.** Figma counts MCP reads against the plan of
+the team that owns the file, not against your seat, so a file in your Drafts
+gets the Starter allowance of six calls a month even on a paid plan. The
+imported report is therefore cached in `.learning-copilot/figma-tokens.json`,
+and regenerating the stylesheet from it is free — only an explicit re-import
+contacts Figma. Sharing that JSON file with someone lets them generate the same
+CSS without a Figma account at all.
+
 ## Requirements
 
 - VS Code `^1.109.0`
@@ -66,6 +116,10 @@ Language Model API only accepts images); images work on either transport.
 - Either the GitHub Copilot Chat extension (preferred), or GitHub Copilot CLI
   access (the extension can install the CLI for you)
 - Open a workspace/folder before running commands
+- For Import Figma Tokens only: the Figma MCP server configured in VS Code and
+  signed in, plus access to the file you are importing. Link sharing is not
+  enough — Figma checks account permission, so work from your own copy of the
+  design (File → Duplicate to your drafts).
 
 ## Quick Start
 
@@ -92,6 +146,7 @@ in the Command Palette:
 - `Learning Copilot: Open Menu`
 - `Learning Copilot: Create or Update Project from Prompt`
 - `Learning Copilot: Analyze Design Files`
+- `Learning Copilot: Import Figma Tokens`
 - `Learning Copilot: Open Learning Exercises`
 - `Learning Copilot: Compare Active File With Solution`
 - `Learning Copilot: Apply Solution For Task At Cursor`
@@ -134,6 +189,8 @@ arrows, and Return.
 - `learningCopilot.copilotPath` (default: `copilot`)
 - `learningCopilot.autoInstallCopilotCli` (default: `true`)
 - `learningCopilot.copilotArgs` (default: `[]`)
+- `learningCopilot.figmaTokensPath` (default: `tokens.css`) — where the
+  stylesheet generated from Figma variables is written.
 
 ## Output and Storage
 
@@ -142,6 +199,9 @@ arrows, and Return.
   - `state.json` — task solutions, hints, completion state, design analyses
   - `solutions/` — full solution copies of every scaffolded file
   - `answer-keys/` — the five most recent answer keys
+  - `figma-tokens.json` — the last imported Figma token report
+- CSS generated from Figma variables goes to `tokens.css` (see
+  `learningCopilot.figmaTokensPath`).
 - Compare uses the solution snapshot and currently active file.
 
 Keeping state in the project means an exercise folder can be copied, renamed,

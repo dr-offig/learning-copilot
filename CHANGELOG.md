@@ -6,6 +6,32 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+## [0.0.7]
+
+- New **Import Figma Tokens** command and menu item. It reads a Figma file's
+  variable collections, modes, aliases and text styles, and writes them out as
+  CSS custom properties: primitive tokens as fixed values, semantic tokens as
+  `var()` references to those primitives, and every non-default mode as an
+  override. Modes named Light and Dark become `prefers-color-scheme` queries;
+  for anything else — breakpoints, brands, themes — you are asked once how the
+  mode should apply, and the answer is remembered.
+- Breakpoints are suggested from the design rather than guessed. The import
+  also reads the top-level artboard sizes, so a `Tablet` mode offers
+  `max-width: 768px` because that is how wide the Tablet frame actually is.
+- The conversion is a plain deterministic transform rather than a prompt, so
+  nothing is dropped or renamed on the way through. Tokens that cannot be
+  converted are reported instead of being silently skipped: dangling aliases,
+  alias loops, and values that would break out of the stylesheet.
+- Imported tokens are cached in `.learning-copilot/figma-tokens.json`.
+  Regenerating the stylesheet uses the cache and costs nothing; only an
+  explicit re-import contacts Figma. This matters because Figma meters MCP
+  reads against the plan of the team owning the file, and a file in a
+  student's Drafts is allowed six a month.
+- New `learningCopilot.figmaTokensPath` setting for where the generated
+  stylesheet goes (default `tokens.css`).
+- Requires the Figma MCP server to be configured in VS Code and signed in.
+  Learning Copilot calls it directly, so importing tokens never sends you to
+  Copilot Chat and never spends a Copilot request.
 - Exercise state (tasks, solutions, hints, completion, answer keys, design
   analyses) now lives in a `.learning-copilot/` folder inside the project
   instead of VS Code's per-workspace and global storage, so copying, renaming
@@ -16,5 +42,7 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
   file. Existing exercises files are repaired on open.
 - Solution snapshots now merge across runs, so Compare With Solution keeps
   working for files scaffolded by an earlier run.
+
+## [0.0.1]
 
 - Initial release

@@ -18,20 +18,42 @@ import {
 import { parseImageDimensions } from "./imagemeta";
 import { generateScaffoldPlanDeterministic, type ScaffoldFileInput } from "./scaffold";
 import {
+  applyBaseModes,
+  emitTokensCss,
+  findFrameCandidatesForMode,
+  orderModeConditions,
+  parseFigmaTokenReport,
+  toKebabCase,
+  type EmitCssResult,
+  type FigmaFrameReport,
+  type FigmaTokenReport,
+  type ModeCondition,
+} from "./figmatokens";
+import {
+  extractFigmaTokens,
+  findUseFigmaTool,
+  listAvailableToolNames,
+  parseFigmaFileKey,
+} from "./figmatransport";
+import {
   copyDirInto,
   emptyScaffoldState,
   getAnswerKeysDir,
+  getFigmaReportPath,
   getLatestAnswerKeyPath,
   getSolutionsDir,
   hasSolutionSnapshot,
   hasStateFile,
+  readFigmaReport,
   readScaffoldState,
   readScaffoldStateSync,
   readSolutionFile,
   writeAnswerKey,
+  writeFigmaReport,
   writeScaffoldState,
   writeSolutionSnapshot,
   STATE_DIR_NAME,
+  type FigmaImportState,
   type WorkspaceScaffoldState,
 } from "./state";
 import {
@@ -2617,6 +2639,194 @@ async function ensureDesignAnalyses(args: {
 
 //#endregion
 
+//#region <FIGMA TOKENS>
+/**
+* ============================================================================
+* <FIGMA TOKENS>
+* ============================================================================
+* Importing a Figma file's variables, modes and text styles, and turning them
+* into CSS custom properties.
+*
+* Extraction runs code inside Figma over MCP and is metered by Figma against
+* the plan of the team owning the file — a student's Drafts copy gets the
+* Starter allowance of six calls a month. So the extracted report is cached in
+* `.learning-copilot/figma-tokens.json` and regenerating CSS from it is free;
+* only an explicit re-extract spends a call.
+*/
+
+/** Only light and dark can be inferred; everything else needs a decision. */
+type ModeChoice = vscode.QuickPickItem & { build?: () => Promise<ModeCondition | undefined> };
+
+function getFigmaTokensPath(): string {
+  return vscode.workspace
+    .getConfiguration("learningCopilot")
+    .get<string>("figmaTokensPath", "tokens.css")
+    .trim() || "tokens.css";
+}
+
+/** Modes whose CSS meaning the emitter can work out on its own. */
+function isInferableMode(mode: string): boolean {
+  const k = mode.trim().toLowerCase();
+  return k === "light" || k === "dark";
+}
+
+async function askWidthQuery(
+  mode: string,
+  kind: "max" | "min",
+  suggested?: number
+): Promise<ModeCondition | undefined> {
+  const width = await vscode.window.showInputBox({
+    title: `Breakpoint for the '${mode}' mode`,
+    prompt: `Applies when the viewport is at ${kind === "max" ? "most" : "least"} this wide`,
+    value: suggested ? `${suggested}px` : "48rem",
+    validateInput: (v) =>
+      /^[0-9.]+(px|rem|em)$/.test(v.trim()) ? undefined : "Enter a width such as 48rem, 768px, or 40em.",
+  });
+  if (!width) { return undefined; }
+  return { kind: "media", query: `(${kind}-width: ${width.trim()})` };
+}
+
+/**
+* Asks how one non-base mode should appear in CSS.
+*
+* When the design has an artboard matching the mode name, its width leads the
+* list — the breakpoint is then a decision the designer already made, rather
+* than a number the student has to invent.
+*
+* @param mode Figma mode name.
+* @param collection Collection the mode belongs to, for context.
+* @param frames Artboards captured during extraction.
+*/
+async function askModeCondition(
+  mode: string,
+  collection: string,
+  frames?: FigmaFrameReport[]
+): Promise<ModeCondition | undefined> {
+  // Several candidates means the design is ambiguous — usually an annotation
+  // or spec frame carrying the mode's name next to the real layout. Offer them
+  // all rather than picking: the student can see which is their layout, and a
+  // silently wrong breakpoint is far worse than one extra decision.
+  const candidates = findFrameCandidatesForMode(frames, mode);
+  const items: ModeChoice[] = candidates.map((frame) => ({
+    label: `$(device-mobile) Narrower screens — max-width: ${frame.width}px`,
+    description:
+      `From the '${frame.name}' frame` +
+      (frame.height ? ` (${frame.width}×${frame.height}` : ` (${frame.width}px wide`) +
+      (frame.page ? `, on ${frame.page})` : ")"),
+    build: async () => ({ kind: "media", query: `(max-width: ${frame.width}px)` }),
+  }));
+
+  items.push(
+    {
+      label: "$(device-mobile) Narrower screens (max-width)",
+      description: "A responsive breakpoint that applies below a width",
+      build: () => askWidthQuery(mode, "max", candidates[0]?.width),
+    },
+    {
+      label: "$(device-desktop) Wider screens (min-width)",
+      description: "A responsive breakpoint that applies above a width",
+      build: () => askWidthQuery(mode, "min", candidates[0]?.width),
+    },
+    {
+      label: "$(color-mode) Dark colour scheme",
+      description: "@media (prefers-color-scheme: dark)",
+      build: async () => ({ kind: "media", query: "(prefers-color-scheme: dark)" }),
+    },
+    {
+      label: "$(symbol-property) Switched by an attribute",
+      description: `:root[data-mode="${toKebabCase(mode)}"] — you set it in HTML or JavaScript`,
+      build: async () => ({ kind: "selector", selector: `:root[data-mode="${toKebabCase(mode)}"]` }),
+    }
+  );
+
+  const pick = await vscode.window.showQuickPick(items, {
+    title: `How should the '${mode}' mode of '${collection}' apply?`,
+    placeHolder: "Pick when these values should override the defaults",
+    matchOnDescription: true,
+  });
+  return pick?.build ? await pick.build() : undefined;
+}
+
+/**
+* Asks which mode is the default for a multi-mode collection. The default lands
+* in `:root`; every other mode becomes an override. Figma's own ordering is
+* arbitrary, so this cannot be inferred.
+*
+* @param collection Collection name.
+* @param modes Mode names in Figma's order.
+*/
+async function askBaseMode(collection: string, modes: string[]): Promise<string | undefined> {
+  const pick = await vscode.window.showQuickPick(
+    modes.map((mode, i) => ({
+      label: mode,
+      description: i === 0 ? "First in Figma" : undefined,
+      detail: `Values for '${mode}' become the defaults in :root`,
+    })),
+    {
+      title: `Which mode of '${collection}' is the default?`,
+      placeHolder: "The other modes become overrides",
+    }
+  );
+  return pick?.label;
+}
+
+/**
+* Collects the base mode and CSS mapping for every multi-mode collection,
+* reusing anything already decided so a re-run is not an interrogation.
+*
+* @param report Token report to configure.
+* @param saved Choices persisted from a previous import.
+*/
+async function configureFigmaModes(
+  report: FigmaTokenReport,
+  saved: FigmaImportState
+): Promise<{ baseModes: Record<string, string>; modeConditions: Record<string, ModeCondition> } | null> {
+  const baseModes: Record<string, string> = { ...(saved.baseModes ?? {}) };
+  const modeConditions: Record<string, ModeCondition> = { ...(saved.modeConditions ?? {}) };
+
+  for (const collection of report.collections) {
+    const modes = collection.modes;
+    if (modes.length < 2) { continue; }
+
+    let base: string | undefined = baseModes[collection.collection];
+    if (!base || !modes.includes(base)) {
+      base = await askBaseMode(collection.collection, modes);
+      if (!base) { return null; }
+      baseModes[collection.collection] = base;
+    }
+
+    for (const mode of modes) {
+      if (mode === base) { continue; }
+      const key = `${collection.collection}::${mode}`;
+      if (modeConditions[key] || modeConditions[mode]) { continue; }
+      if (isInferableMode(mode)) { continue; }
+
+      const condition = await askModeCondition(mode, collection.collection, report.frames);
+      if (!condition) { return null; }
+      modeConditions[key] = condition;
+    }
+  }
+
+  return { baseModes, modeConditions };
+}
+
+/** Writes the generated stylesheet and reports what happened. */
+async function writeFigmaTokensCss(wsRoot: vscode.Uri, result: EmitCssResult, output: vscode.OutputChannel): Promise<vscode.Uri> {
+  const rel = getFigmaTokensPath();
+  const uri = vscode.Uri.joinPath(wsRoot, ...rel.split("/"));
+  await vscode.workspace.fs.writeFile(uri, Buffer.from(result.css, "utf8"));
+
+  output.appendLine(
+    `[figma] Wrote ${rel}: ${result.stats.primitiveVariables} primitive and ${result.stats.semanticVariables} semantic ` +
+    `variable(s), ${result.stats.textStyles} text style(s), ${result.stats.emittedDeclarations} declaration(s).`
+  );
+  for (const w of result.warnings) { output.appendLine(`[figma] warning: ${w}`); }
+  for (const e of result.errors) { output.appendLine(`[figma] error: ${e}`); }
+  return uri;
+}
+
+//#endregion
+
 //#region <MENU>
 /**
 * ============================================================================
@@ -2680,6 +2890,11 @@ async function showLearningCopilotMenu(): Promise<void> {
       label: "$(file-media) Analyze Design Files",
       description: "Describe PDF/image mockups so prompts can reference them by filename",
       command: "learningCopilot.analyzeDesignFiles",
+    },
+    {
+      label: "$(symbol-color) Import Figma Tokens",
+      description: "Turn a Figma file's variables, modes and text styles into CSS variables",
+      command: "learningCopilot.importFigmaTokens",
     },
     { label: "Learning Tasks", kind: vscode.QuickPickItemKind.Separator },
     {
@@ -3979,6 +4194,142 @@ export async function activate(context: vscode.ExtensionContext) {
       } catch {
         // Notes file is missing only if every analysis failed; warnings were already shown.
       }
+    })
+  );
+
+  // Import Figma variables, modes and text styles, and write them as CSS.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("learningCopilot.importFigmaTokens", async () => {
+      const wsRoot = getWorkspaceRootUri();
+      if (!wsRoot) {
+        vscode.window.showErrorMessage("Open a folder/workspace first.");
+        return;
+      }
+
+      const saved: FigmaImportState = { ...getScaffoldState().figma };
+      const cachedRaw = await readFigmaReport(wsRoot.fsPath);
+
+      // Re-extracting is the metered operation, so a cached report is the
+      // default and spending a Figma call is the deliberate choice.
+      let report: FigmaTokenReport | null = null;
+      if (cachedRaw) {
+        const when = saved.extractedAt ? new Date(saved.extractedAt).toLocaleString() : "an earlier session";
+        const choice = await vscode.window.showInformationMessage(
+          `Learning Copilot already has Figma tokens imported (${when}).`,
+          { modal: false },
+          "Regenerate CSS",
+          "Re-import from Figma"
+        );
+        if (!choice) { return; }
+        if (choice === "Regenerate CSS") {
+          try {
+            report = parseFigmaTokenReport(cachedRaw);
+          } catch (e: any) {
+            vscode.window.showWarningMessage(
+              `The cached Figma report could not be read (${e?.message ?? String(e)}); re-importing.`
+            );
+          }
+        }
+      }
+
+      if (!report) {
+        const lookup = findUseFigmaTool();
+        if (!lookup.ok) {
+          const available = listAvailableToolNames();
+          output.show(true);
+          output.appendLine(`[figma] ${lookup.reason}`);
+          output.appendLine(
+            available.length > 0
+              ? `[figma] ${available.length} language model tool(s) visible: ${available.join(", ")}`
+              : "[figma] VS Code is exposing no language model tools at all. If this is the Extension Development Host, " +
+                "check it was not launched with --disable-extensions."
+          );
+          const choice = await vscode.window.showErrorMessage(lookup.reason, "How do I set this up?");
+          if (choice) {
+            await vscode.env.openExternal(
+              vscode.Uri.parse("https://developers.figma.com/docs/figma-mcp-server/remote-server-installation")
+            );
+          }
+          return;
+        }
+
+        // VS Code confirms MCP tool calls by showing the tool's raw input,
+        // which here is the whole extractor script — alarming if it arrives
+        // unannounced. Warn in the prompt just before it appears.
+        const entered = await vscode.window.showInputBox({
+          title: "Import Figma tokens",
+          prompt:
+            "Paste the Figma file URL (or its file key). VS Code will then ask you to allow running Learning Copilot's " +
+            "extractor in Figma — the script it shows you is that extractor; approve it to continue.",
+          value: saved.fileKey ?? "",
+          ignoreFocusOut: true,
+          validateInput: (v) =>
+            !v.trim() || parseFigmaFileKey(v) ? undefined : "That does not look like a Figma file URL or key.",
+        });
+        if (!entered) { return; }
+        const fileKey = parseFigmaFileKey(entered);
+        if (!fileKey) { return; }
+
+        output.show(true);
+        let extraction;
+        try {
+          extraction = await vscode.window.withProgress(
+            {
+              location: vscode.ProgressLocation.Notification,
+              title: "Learning Copilot: Importing Figma tokens",
+              cancellable: true,
+            },
+            (progress, token) =>
+              extractFigmaTokens({
+                fileKey,
+                knownDeliveryMode: saved.deliveryMode,
+                output,
+                token,
+                report: (message) => progress.report({ message }),
+              })
+          );
+        } catch (e: any) {
+          vscode.window.showErrorMessage(`Figma import failed: ${e?.message ?? String(e)}`);
+          return;
+        }
+
+        report = extraction.report;
+        saved.fileKey = fileKey;
+        saved.extractedAt = new Date().toISOString();
+        saved.deliveryMode = extraction.deliveryMode;
+        await writeFigmaReport(wsRoot.fsPath, report);
+        if (extraction.learned) {
+          output.appendLine(
+            `[figma] Learned that use_figma delivers by '${extraction.deliveryMode}'; later imports will be a single call.`
+          );
+        }
+      }
+
+      const modes = await configureFigmaModes(report, saved);
+      if (!modes) { return; }
+      saved.baseModes = modes.baseModes;
+      saved.modeConditions = orderModeConditions(modes.modeConditions);
+
+      await updateScaffoldState(wsRoot, (state) => ({ ...state, figma: { ...saved } }));
+
+      const result = emitTokensCss(applyBaseModes(report, saved.baseModes), {
+        modeConditions: saved.modeConditions,
+      });
+      const uri = await writeFigmaTokensCss(wsRoot, result, output);
+
+      const summary =
+        `Wrote ${getFigmaTokensPath()} — ${result.stats.primitiveVariables} primitive and ` +
+        `${result.stats.semanticVariables} semantic variable(s), ${result.stats.textStyles} text style(s).`;
+      if (result.errors.length > 0) {
+        vscode.window.showWarningMessage(`${summary} ${result.errors.length} token(s) could not be converted; see the output channel.`);
+      } else if (result.warnings.length > 0) {
+        vscode.window.showInformationMessage(`${summary} ${result.warnings.length} warning(s); see the output channel.`);
+      } else {
+        vscode.window.showInformationMessage(summary);
+      }
+
+      output.appendLine(`[figma] Cached report: ${getFigmaReportPath(wsRoot.fsPath)}`);
+      await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(uri), { preview: false });
     })
   );
 }

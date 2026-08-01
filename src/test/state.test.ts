@@ -11,10 +11,12 @@ import {
 	hasSolutionSnapshot,
 	hasStateFile,
 	parseScaffoldState,
+	readFigmaReport,
 	readScaffoldState,
 	readScaffoldStateSync,
 	readSolutionFile,
 	writeAnswerKey,
+	writeFigmaReport,
 	writeScaffoldState,
 	writeSolutionSnapshot,
 	STATE_DIR_NAME,
@@ -94,6 +96,71 @@ suite('workspace state', () => {
 		);
 		assert.strictEqual(partial.tasks.length, 1);
 		assert.strictEqual(partial.tasks[0].id, 'ok');
+	});
+
+	test('figma import choices survive a save/load round trip', async () => {
+		const root = await newRoot();
+		const figma = {
+			fileKey: 'CNwr0twjwrQOY5hTMtu0IH',
+			extractedAt: '2026-08-01T06:02:07.360Z',
+			deliveryMode: 'throw' as const,
+			baseModes: { 'Semantic Colours': 'Light', 'Font Sizes and Spacing': 'Desktop' },
+			modeConditions: {
+				'Font Sizes and Spacing::Tablet': { kind: 'media' as const, query: '(max-width: 64rem)' },
+				'Font Sizes and Spacing::Phone': { kind: 'media' as const, query: '(max-width: 40rem)' },
+			},
+		};
+
+		await writeScaffoldState(root, { ...emptyScaffoldState(), figma });
+		const loaded = await readScaffoldState(root);
+
+		assert.deepStrictEqual(loaded.figma, figma);
+		// Order matters: it decides which override block wins on a phone.
+		assert.deepStrictEqual(Object.keys(loaded.figma.modeConditions!), [
+			'Font Sizes and Spacing::Tablet',
+			'Font Sizes and Spacing::Phone',
+		]);
+	});
+
+	test('a state file written before figma support still loads', () => {
+		const legacy = parseScaffoldState(JSON.stringify({ tasks: [], imageRoles: {}, designAnalyses: {} }));
+
+		assert.deepStrictEqual(legacy.figma, {});
+	});
+
+	test('nonsense in the figma block is dropped rather than trusted', () => {
+		const state = parseScaffoldState(
+			JSON.stringify({
+				figma: {
+					fileKey: 42,
+					deliveryMode: 'telepathy',
+					baseModes: { Good: 'Light', Bad: 7 },
+					modeConditions: {
+						Keep: { kind: 'media', query: '(max-width: 40rem)' },
+						NoQuery: { kind: 'media' },
+						Unknown: { kind: 'wat' },
+					},
+				},
+			})
+		);
+
+		assert.strictEqual(state.figma.fileKey, undefined);
+		assert.strictEqual(state.figma.deliveryMode, undefined);
+		assert.deepStrictEqual(state.figma.baseModes, { Good: 'Light' });
+		assert.deepStrictEqual(Object.keys(state.figma.modeConditions!), ['Keep']);
+	});
+
+	test('the extracted figma report is cached beside the rest of the state', async () => {
+		const root = await newRoot();
+		assert.strictEqual(await readFigmaReport(root), null);
+
+		const report = { collections: [{ collection: 'C', modes: ['M'], variables: [] }] };
+		const target = await writeFigmaReport(root, report);
+
+		assert.ok(target.startsWith(path.join(root, STATE_DIR_NAME)));
+		assert.deepStrictEqual(await readFigmaReport(root), report);
+		// No leftover temp file from the atomic write.
+		assert.ok(!fs.existsSync(`${target}.tmp`));
 	});
 
 	test('snapshots merge rather than replace across runs', async () => {

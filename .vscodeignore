@@ -4,12 +4,21 @@
 # --- Source and build tooling ---
 src/**
 out/**
+scripts/**
 node_modules/**
 esbuild.js
 **/tsconfig.json
 **/eslint.config.mjs
 **/*.ts
 **/*.map
+
+# --- Local working files ---
+# Figma imports and their generated CSS are per-project output, not something
+# to ship: report.json in particular is a dump of whatever design system was
+# last imported.
+report.json
+tokens.css
+.learning-copilot/**
 
 # --- Editor and test harness ---
 .vscode/**

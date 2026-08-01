@@ -23,6 +23,7 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 
 import { normalizeRelativePath } from "./masking";
+import type { ModeCondition } from "./figmatokens";
 import type { DesignAnalysisRecord, ImageRole, ScaffoldTask, WrittenFile } from "./types";
 
 /** Folder holding all workspace-local Learning Copilot state. */
@@ -31,21 +32,42 @@ export const STATE_DIR_NAME = ".learning-copilot";
 const STATE_FILE_NAME = "state.json";
 const SOLUTIONS_DIR_NAME = "solutions";
 const ANSWER_KEYS_DIR_NAME = "answer-keys";
+const FIGMA_REPORT_FILE_NAME = "figma-tokens.json";
 
 /** How many timestamped answer keys to retain. */
 const ANSWER_KEYS_KEEP = 5;
 
 const STATE_VERSION = 1;
 
+/**
+ * What we remember between Figma imports. Deliberately small: the extracted
+ * report itself is a separate file, because it is large and because a student
+ * or instructor may want to hand it around on its own.
+ *
+ * `deliveryMode` is the answer to whether `use_figma` surfaces a script's
+ * return value. Learning it once turns every later import into a single tool
+ * call, which matters when a Drafts-hosted file only allows six a month.
+ */
+export type FigmaImportState = {
+  fileKey?: string;
+  extractedAt?: string;
+  deliveryMode?: "return" | "throw";
+  /** Mode chosen to occupy `:root`, per collection name. */
+  baseModes?: Record<string, string>;
+  /** CSS mapping for non-base modes, keyed as the emitter expects. */
+  modeConditions?: Record<string, ModeCondition>;
+};
+
 export type WorkspaceScaffoldState = {
   version: number;
   tasks: ScaffoldTask[];
   imageRoles: Record<string, ImageRole>;
   designAnalyses: Record<string, DesignAnalysisRecord>;
+  figma: FigmaImportState;
 };
 
 export function emptyScaffoldState(): WorkspaceScaffoldState {
-  return { version: STATE_VERSION, tasks: [], imageRoles: {}, designAnalyses: {} };
+  return { version: STATE_VERSION, tasks: [], imageRoles: {}, designAnalyses: {}, figma: {} };
 }
 
 export function getStateDir(root: string): string {
@@ -62,6 +84,10 @@ export function getSolutionsDir(root: string): string {
 
 export function getAnswerKeysDir(root: string): string {
   return path.join(getStateDir(root), ANSWER_KEYS_DIR_NAME);
+}
+
+export function getFigmaReportPath(root: string): string {
+  return path.join(getStateDir(root), FIGMA_REPORT_FILE_NAME);
 }
 
 export function hasStateFile(root: string): boolean {
@@ -117,7 +143,58 @@ export function parseScaffoldState(raw: string): WorkspaceScaffoldState {
     }
   }
 
+  if (parsed.figma && typeof parsed.figma === "object") {
+    const f = parsed.figma;
+    if (typeof f.fileKey === "string") { state.figma.fileKey = f.fileKey; }
+    if (typeof f.extractedAt === "string") { state.figma.extractedAt = f.extractedAt; }
+    if (f.deliveryMode === "return" || f.deliveryMode === "throw") { state.figma.deliveryMode = f.deliveryMode; }
+    if (f.baseModes && typeof f.baseModes === "object") {
+      state.figma.baseModes = {};
+      for (const [collection, mode] of Object.entries<any>(f.baseModes)) {
+        if (typeof mode === "string") { state.figma.baseModes[collection] = mode; }
+      }
+    }
+    if (f.modeConditions && typeof f.modeConditions === "object") {
+      state.figma.modeConditions = {};
+      for (const [mode, condition] of Object.entries<any>(f.modeConditions)) {
+        if (!condition || typeof condition !== "object") { continue; }
+        if (condition.kind === "base") {
+          state.figma.modeConditions[mode] = { kind: "base" };
+        } else if (condition.kind === "media" && typeof condition.query === "string") {
+          state.figma.modeConditions[mode] = { kind: "media", query: condition.query };
+        } else if (condition.kind === "selector" && typeof condition.selector === "string") {
+          state.figma.modeConditions[mode] = { kind: "selector", selector: condition.selector };
+        }
+      }
+    }
+  }
+
   return state;
+}
+
+/** Reads the cached Figma token report, or null when none has been imported. */
+export async function readFigmaReport(root: string): Promise<unknown | null> {
+  try {
+    return JSON.parse(await fsp.readFile(getFigmaReportPath(root), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Caches an extracted Figma token report next to the rest of the workspace
+ * state, so re-generating CSS never costs another metered Figma call.
+ *
+ * @param root Workspace root path.
+ * @param report Parsed token report.
+ */
+export async function writeFigmaReport(root: string, report: unknown): Promise<string> {
+  await fsp.mkdir(getStateDir(root), { recursive: true });
+  const target = getFigmaReportPath(root);
+  const tmp = `${target}.tmp`;
+  await fsp.writeFile(tmp, JSON.stringify(report, null, 2) + "\n", "utf8");
+  await fsp.rename(tmp, target);
+  return target;
 }
 
 /**

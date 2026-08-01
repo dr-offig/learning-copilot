@@ -4,3 +4,9 @@ node_modules
 .vscode-test/
 *.vsix
 .claude/**
+
+# Left behind by testing the Figma import in this repo. report.json is a dump
+# of whatever design system was last imported, so it is not ours to commit.
+report.json
+tokens.css
+.learning-copilot/

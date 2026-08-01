@@ -1,9 +1,9 @@
 {
   "name": "learning-copilot",
   "publisher": "dr-offig",
-  "displayName": "learning-copilot",
+  "displayName": "Learning Copilot",
   "description": "AI code generator that creates learning tasks and exercises",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "repository" : {
     "type": "git",
     "url": "https://github.com/dr-offig/learning-copilot.git"
@@ -26,6 +26,7 @@
       { "command": "learningCopilot.showMenu", "title": "Learning Copilot: Open Menu", "icon": "$(mortar-board)" },
       { "command": "learningCopilot.generateFromPrompt", "title": "Learning Copilot: Create or Update Project from Prompt" },
       { "command": "learningCopilot.analyzeDesignFiles", "title": "Learning Copilot: Analyze Design Files" },
+      { "command": "learningCopilot.importFigmaTokens", "title": "Learning Copilot: Import Figma Tokens" },
       { "command": "learningCopilot.openExercises", "title": "Learning Copilot: Open Learning Exercises" },
       { "command": "learningCopilot.compareWithSolution", "title": "Learning Copilot: Compare Active File With Solution"},
       { "command": "learningCopilot.applyTaskAtCursor", "title": "Learning Copilot: Apply Solution For Task At Cursor" },
@@ -86,6 +87,11 @@
           ],
           "description": "How Learning Copilot talks to the model."
         },
+        "learningCopilot.figmaTokensPath": {
+          "type": "string",
+          "default": "tokens.css",
+          "description": "Workspace-relative path for the stylesheet generated from Figma variables."
+        },
         "learningCopilot.modelFamily": {
           "type": "string",
           "default": "",
@@ -105,6 +111,8 @@
     "watch-tests": "tsc -p . -w --outDir out",
     "pretest": "npm run compile-tests && npm run compile && npm run lint",
     "check-types": "tsc --noEmit",
+    "figma:css": "npm run compile-tests && node scripts/emit-tokens.js",
+    "figma:script": "npm run compile-tests --silent && node scripts/figma-extract.js",
     "lint": "eslint src",
     "test": "vscode-test"
   },

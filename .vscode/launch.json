@@ -2,6 +2,21 @@
   "version": "0.2.0",
   "configurations": [
     {
+      // Other extensions stay enabled, which is what the Figma import needs:
+      // it calls MCP tools through vscode.lm.invokeTool, and the clean host
+      // below starves it of both Copilot and anything MCP-adjacent.
+      "name": "Run Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "runtimeExecutable": "${execPath}",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"],
+      "preLaunchTask": "watch:esbuild"
+    },
+    {
+      // For reproducing student-style breakage: no Copilot Chat, no MCP, so
+      // the Copilot CLI fallback and the "tool not available" paths are the
+      // ones actually exercised.
       "name": "Run Extension (clean host)",
       "type": "extensionHost",
       "request": "launch",
