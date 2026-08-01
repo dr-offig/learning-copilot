@@ -16,7 +16,7 @@
 import * as vscode from "vscode";
 
 import { DELIVERY_MODES, buildExtractorScript, readExtractorResult } from "./figmascript";
-import type { DeliveryMode } from "./figmascript";
+import type { DeliveryMode, ExtractorOptions } from "./figmascript";
 import type { FigmaTokenReport } from "./figmatokens";
 
 /**
@@ -132,6 +132,8 @@ export type ExtractFigmaTokensArgs = {
   fileKey: string;
   /** Delivery mode learned on a previous run; tried first when known. */
   knownDeliveryMode?: DeliveryMode;
+  /** What the extractor should capture; defaults to tokens only. */
+  scriptOptions?: ExtractorOptions;
   output: vscode.OutputChannel;
   token?: vscode.CancellationToken;
   report?: (message: string) => void;
@@ -176,7 +178,7 @@ export async function extractFigmaTokens(args: ExtractFigmaTokensArgs): Promise<
         : "Extracting variables and text styles from Figma…"
     );
 
-    const input = buildToolInput(tool, fileKey, buildExtractorScript(mode));
+    const input = buildToolInput(tool, fileKey, buildExtractorScript(mode, args.scriptOptions ?? {}));
     let text: string;
     try {
       const result = await vscode.lm.invokeTool(

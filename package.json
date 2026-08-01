@@ -27,6 +27,7 @@
       { "command": "learningCopilot.generateFromPrompt", "title": "Learning Copilot: Create or Update Project from Prompt" },
       { "command": "learningCopilot.analyzeDesignFiles", "title": "Learning Copilot: Analyze Design Files" },
       { "command": "learningCopilot.importFigmaTokens", "title": "Learning Copilot: Import Figma Tokens" },
+      { "command": "learningCopilot.importFigmaStructure", "title": "Learning Copilot: Import Figma Page Structure" },
       { "command": "learningCopilot.openExercises", "title": "Learning Copilot: Open Learning Exercises" },
       { "command": "learningCopilot.compareWithSolution", "title": "Learning Copilot: Compare Active File With Solution"},
       { "command": "learningCopilot.applyTaskAtCursor", "title": "Learning Copilot: Apply Solution For Task At Cursor" },

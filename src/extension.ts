@@ -30,6 +30,11 @@ import {
   type ModeCondition,
 } from "./figmatokens";
 import {
+  buildFigmaDesignContext,
+  countLayoutNodes,
+  listUsedTokens,
+} from "./figmalayout";
+import {
   extractFigmaTokens,
   findUseFigmaTool,
   listAvailableToolNames,
@@ -1899,20 +1904,25 @@ const FILE_PLAN_SCHEMA_TEXT =
 function buildGeneratePlanInstructions(
   userPrompt: string,
   hasDesignAnalyses: boolean,
-  hasImageAssets: boolean
+  hasImageAssets: boolean,
+  hasFigmaDesign: boolean
 ): string {
   return (
     "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
     `Schema: ${FILE_PLAN_SCHEMA_TEXT}. ` +
     "Also output BOTH studentBriefMd and studentBrief. studentBriefMd should be a concise learner-facing markdown brief that explains what was created, what the resulting interface/behavior should look like or do, and which files are important. studentBrief should contain the same information in structured form: overviewMd plus sections. Write both for a student who will read the brief while a later learning scaffold is being generated. " +
     "IMPORTANT: Do NOT inspect the workspace. Do NOT list directories. Do NOT search files. Do NOT run tools. Do NOT create temp files. Do NOT validate by writing files. Do NOT attempt to edit the workspace yourself. Return the JSON response directly from reasoning only. " +
-    (hasDesignAnalyses || hasImageAssets ? "The INPUT PAYLOAD is a JSON object. " : "") +
+    (hasDesignAnalyses || hasImageAssets || hasFigmaDesign ? "The INPUT PAYLOAD is a JSON object. " : "") +
     (hasDesignAnalyses
       ? "Its 'designAnalyses' property is an array of design-document analyses ({path,analysisMd}) describing design files (PDF/image mockups) that exist in the workspace. When the task references one of these files by name, implement the corresponding analysis faithfully (layout, colors, typography, content). " +
         "If the task doesn't reference any design file explicitly but clearly concerns the same subject, use the analyses as the design guide. "
       : "") +
     (hasImageAssets
       ? "Its 'imageAssets' property lists image files that already exist in the workspace ({path,mimeType,width,height,sizeBytes}). Where images fit the task, reference these files by their exact relative paths in generated code (e.g. <img src>, CSS url()), using width/height for sizing and aspect ratios. NEVER invent paths to image files that are not in this list, and do not emit placeholder image files. "
+      : "") +
+    (hasFigmaDesign
+      ? "Its 'figmaDesign' property is a markdown description read directly out of the Figma file: artboard sizes, design tokens with their per-mode values, text styles, and the page structure as a nested outline. It is exact rather than inferred, so prefer it over any analysis of a design image where they disagree. "
+        + "Reproduce that structure, and wherever a layer names a bound token, emit the corresponding CSS custom property from tokens.css rather than a literal value. Tokens whose table shows different values per mode are the responsive design: implement them as custom properties overridden in media queries, not as hard-coded breakpoint values. "
       : "") +
     "All paths must be relative to the workspace root and must not contain '..' or start with '/'. " +
     "Prefer best practice separation of concerns. " +
@@ -1924,7 +1934,8 @@ function buildModifyPlanInstructions(
   userPrompt: string,
   activeRel: string | null,
   hasDesignAnalyses: boolean,
-  hasImageAssets: boolean
+  hasImageAssets: boolean,
+  hasFigmaDesign: boolean
 ): string {
   return (
     "Return JSON only. No prose. No markdown, unless the entire response is a single ```json fenced block. " +
@@ -1937,6 +1948,9 @@ function buildModifyPlanInstructions(
       : "") +
     (hasImageAssets
       ? ", and whose 'imageAssets' property lists image files that already exist in the workspace ({path,mimeType,width,height,sizeBytes}) — where images fit the task, reference these files by their exact relative paths in generated code (e.g. <img src>, CSS url()), using width/height for sizing and aspect ratios, and NEVER invent paths to image files that are not in this list"
+      : "") +
+    (hasFigmaDesign
+      ? ", and whose 'figmaDesign' property is a markdown description read directly out of the Figma file (artboard sizes, design tokens with per-mode values, text styles, and the page structure as a nested outline) — it is exact rather than inferred, so prefer it over any analysis of a design image where they disagree, emit the named token as a CSS custom property from tokens.css rather than a literal value, and treat tokens that differ per mode as the responsive design to implement with media queries"
       : "") +
     ". " +
     "Only include files that need to be created or changed. Do not include unchanged files. " +
@@ -2502,10 +2516,17 @@ async function ensureDesignAnalyses(args: {
   runtime: LlmRuntime;
   output: vscode.OutputChannel;
   assets: DesignAsset[];
+  /**
+   * Relative paths the student chose to spend an AI call on. Omit to consider
+   * them all. `assets` must still list every design document present, because
+   * the cache is pruned against it — narrowing that instead would silently
+   * discard the analyses of the files not chosen.
+   */
+  analyzeOnly?: Set<string>;
   force?: boolean;
   report?: (message: string) => void;
 }): Promise<{ analyses: DesignAnalysis[]; analyzedCount: number }> {
-  const { wsRoot, runtime, output, assets, force, report } = args;
+  const { wsRoot, runtime, output, assets, analyzeOnly, force, report } = args;
 
   const cache: Record<string, DesignAnalysisRecord> = { ...getScaffoldState().designAnalyses };
 
@@ -2543,6 +2564,7 @@ async function ensureDesignAnalyses(args: {
     }
 
     const hash = sha256Hex(bytes);
+    if (analyzeOnly && !analyzeOnly.has(asset.rel)) { continue; }
     if (!force && cache[asset.rel]?.hash === hash) { continue; }
 
     // PDFs and oversized images can only go through the CLI transport.
@@ -2810,6 +2832,26 @@ async function configureFigmaModes(
   return { baseModes, modeConditions };
 }
 
+/** Student-visible record of what was read out of the Figma file. */
+const FIGMA_DESIGN_FILENAME = "FIGMA_DESIGN.md";
+
+/**
+* Reads the Figma design context a previous import wrote, for handing to the
+* model alongside any analysed design images. Returns null when the student
+* has never imported one — this is additional context, never a requirement.
+*
+* @param wsRoot Workspace root URI.
+*/
+async function readFigmaDesignContext(wsRoot: vscode.Uri): Promise<string | null> {
+  try {
+    const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(wsRoot, FIGMA_DESIGN_FILENAME));
+    const text = Buffer.from(bytes).toString("utf8").trim();
+    return text.length > 0 ? text : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Writes the generated stylesheet and reports what happened. */
 async function writeFigmaTokensCss(wsRoot: vscode.Uri, result: EmitCssResult, output: vscode.OutputChannel): Promise<vscode.Uri> {
   const rel = getFigmaTokensPath();
@@ -2895,6 +2937,11 @@ async function showLearningCopilotMenu(): Promise<void> {
       label: "$(symbol-color) Import Figma Tokens",
       description: "Turn a Figma file's variables, modes and text styles into CSS variables",
       command: "learningCopilot.importFigmaTokens",
+    },
+    {
+      label: "$(list-tree) Import Figma Page Structure",
+      description: "Read the layout out of Figma as design context — no AI credits used",
+      command: "learningCopilot.importFigmaStructure",
     },
     { label: "Learning Tasks", kind: vscode.QuickPickItemKind.Separator },
     {
@@ -3328,6 +3375,10 @@ export async function activate(context: vscode.ExtensionContext) {
       output.show(true);
       output.appendLine(`Using transport: ${runtime.client.label}`);
 
+      // Additional context, never a requirement: null unless the student has
+      // imported the page structure from Figma.
+      const figmaDesign = await readFigmaDesignContext(wsRoot);
+
       // Partition workspace images: design documents get analyzed (cached
       // analyses are reused), content assets are listed to the model so
       // generated code can reference them by path.
@@ -3366,13 +3417,15 @@ export async function activate(context: vscode.ExtensionContext) {
           instructions: buildGeneratePlanInstructions(
             userPrompt,
             designAnalyses.length > 0,
-            imageAssets.length > 0
+            imageAssets.length > 0,
+            !!figmaDesign
           ),
           payload:
-            designAnalyses.length > 0 || imageAssets.length > 0
+            designAnalyses.length > 0 || imageAssets.length > 0 || figmaDesign
               ? JSON.stringify({
                   ...(designAnalyses.length > 0 ? { designAnalyses } : {}),
                   ...(imageAssets.length > 0 ? { imageAssets } : {}),
+                  ...(figmaDesign ? { figmaDesign } : {}),
                 })
               : undefined,
           requiredKeys: ["files"],
@@ -3889,6 +3942,8 @@ export async function activate(context: vscode.ExtensionContext) {
             if (!runtime) { return; }
             output.appendLine(`Using transport: ${runtime.client.label}`);
 
+            const figmaDesign = await readFigmaDesignContext(wsRoot);
+
             // Partition workspace images: design documents get analyzed
             // (cached analyses are reused), content assets are listed to the
             // model so generated code can reference them by path.
@@ -3917,12 +3972,14 @@ export async function activate(context: vscode.ExtensionContext) {
                   userPrompt,
                   activeRel,
                   designAnalyses.length > 0,
-                  imageAssets.length > 0
+                  imageAssets.length > 0,
+                  !!figmaDesign
                 ),
                 payload: JSON.stringify({
                   workspaceFiles: ctxFiles,
                   ...(designAnalyses.length > 0 ? { designAnalyses } : {}),
                   ...(imageAssets.length > 0 ? { imageAssets } : {}),
+                  ...(figmaDesign ? { figmaDesign } : {}),
                 }),
                 requiredKeys: ["files"],
                 schemaName: "emit_file_plan",
@@ -4138,6 +4195,36 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
 
+      // Analysing a design document is the only part of this that spends AI
+      // credits, so which ones to spend them on is the student's call. Files
+      // with no cached analysis are pre-ticked; already-analysed ones are not,
+      // since re-analysing them costs the same and usually changes nothing.
+      // (Content assets never appear here — they cost nothing, being read
+      // locally for their pixel dimensions.)
+      let chosen: Set<string> | undefined;
+      if (images.designDocs.length > 1) {
+        const cache = getScaffoldState().designAnalyses;
+        const picks = await vscode.window.showQuickPick(
+          images.designDocs.map((asset) => ({
+            label: asset.rel,
+            description: cache[asset.rel] ? "already analysed" : "not yet analysed",
+            picked: !cache[asset.rel],
+            asset,
+          })),
+          {
+            title: "Which design files should be analysed?",
+            placeHolder: "Each one costs an AI call",
+            canPickMany: true,
+          }
+        );
+        if (!picks) { return; }
+        if (picks.length === 0) {
+          vscode.window.showInformationMessage("No design files selected.");
+          return;
+        }
+        chosen = new Set(picks.map((p) => p.asset.rel));
+      }
+
       const runtime = await resolveLlmRuntime(context, output);
       if (!runtime) { return; }
       output.show(true);
@@ -4156,6 +4243,7 @@ export async function activate(context: vscode.ExtensionContext) {
               runtime,
               output,
               assets: images.designDocs,
+              analyzeOnly: chosen,
               force,
               report: (message) => progress.report({ message }),
             })
@@ -4293,7 +4381,23 @@ export async function activate(context: vscode.ExtensionContext) {
           return;
         }
 
-        report = extraction.report;
+        // A token run captures no layouts, so keep any the structure import
+        // stored: overwriting wholesale would drop them and leave the cache
+        // disagreeing with the FIGMA_DESIGN.md already in the workspace.
+        let previousLayouts: FigmaTokenReport["layouts"];
+        if (cachedRaw) {
+          try {
+            previousLayouts = parseFigmaTokenReport(cachedRaw).layouts;
+          } catch {
+            // Unreadable cache: the fresh tokens still stand on their own.
+          }
+        }
+        report = {
+          ...extraction.report,
+          ...(extraction.report.layouts ?? previousLayouts
+            ? { layouts: extraction.report.layouts ?? previousLayouts }
+            : {}),
+        };
         saved.fileKey = fileKey;
         saved.extractedAt = new Date().toISOString();
         saved.deliveryMode = extraction.deliveryMode;
@@ -4329,6 +4433,142 @@ export async function activate(context: vscode.ExtensionContext) {
       }
 
       output.appendLine(`[figma] Cached report: ${getFigmaReportPath(wsRoot.fsPath)}`);
+      await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(uri), { preview: false });
+    })
+  );
+
+  // Read the artboard structure out of Figma and write it up as design
+  // context. A separate command from the token import because it is a
+  // separate metered call, and because a student may want one without the
+  // other.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("learningCopilot.importFigmaStructure", async () => {
+      const wsRoot = getWorkspaceRootUri();
+      if (!wsRoot) {
+        vscode.window.showErrorMessage("Open a folder/workspace first.");
+        return;
+      }
+
+      const saved: FigmaImportState = { ...getScaffoldState().figma };
+      const cachedRaw = await readFigmaReport(wsRoot.fsPath);
+      // The structure is described in terms of the tokens, and the file key
+      // comes from that same import — a cached report without one is state
+      // from a copied project, so send them through the token import.
+      if (!cachedRaw || !saved.fileKey) {
+        const choice = await vscode.window.showErrorMessage(
+          "Import the Figma tokens first — the page structure is described in terms of them.",
+          "Import Figma Tokens"
+        );
+        if (choice) { await vscode.commands.executeCommand("learningCopilot.importFigmaTokens"); }
+        return;
+      }
+      const fileKey = saved.fileKey;
+
+      let cached: FigmaTokenReport;
+      try {
+        cached = parseFigmaTokenReport(cachedRaw);
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`The cached Figma report could not be read: ${e?.message ?? String(e)}`);
+        return;
+      }
+
+      const lookup = findUseFigmaTool();
+      if (!lookup.ok) {
+        output.show(true);
+        output.appendLine(`[figma] ${lookup.reason}`);
+        output.appendLine(`[figma] tools visible: ${listAvailableToolNames().join(", ") || "(none)"}`);
+        vscode.window.showErrorMessage(lookup.reason);
+        return;
+      }
+
+      // Three breakpoints of one page mostly repeat each other, and what
+      // differs between them is already in the variable modes. Importing one
+      // artboard keeps the payload inside the channel's limit.
+      const known = cached.frames ?? [];
+      let layoutNames: string[] | undefined;
+      if (known.length > 1) {
+        const picked = await vscode.window.showQuickPick(
+          [
+            ...known.map((f) => ({
+              label: f.name,
+              description: `${f.width}px wide`,
+              detail: "Recommended — the other artboards mostly repeat this one, and what differs is already in the token modes",
+              names: [f.name],
+            })),
+            {
+              label: "$(list-unordered) Every artboard",
+              description: `${known.length} artboards`,
+              detail: "Larger; artboards are dropped if the result would exceed what Figma can return in one call",
+              names: undefined as string[] | undefined,
+            },
+          ],
+          { title: "Which artboard's structure should be imported?", placeHolder: "One artboard is usually enough" }
+        );
+        if (!picked) { return; }
+        layoutNames = picked.names;
+      }
+
+      output.show(true);
+      let extraction;
+      try {
+        extraction = await vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: "Learning Copilot: Reading the Figma page structure",
+            cancellable: true,
+          },
+          (progress, token) =>
+            extractFigmaTokens({
+              fileKey,
+              knownDeliveryMode: saved.deliveryMode,
+              // Token detail is already cached and would crowd out the
+              // structure; the variables are still read so the walk can name
+              // the token bound to each colour and gap.
+              scriptOptions: { includeLayouts: true, includeTokens: false, ...(layoutNames ? { layoutNames } : {}) },
+              output,
+              token,
+              report: (message) => progress.report({ message }),
+            })
+        );
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`Figma structure import failed: ${e?.message ?? String(e)}`);
+        return;
+      }
+
+      const merged: FigmaTokenReport = {
+        ...cached,
+        ...(extraction.report.frames ? { frames: extraction.report.frames } : {}),
+        ...(extraction.report.layouts ? { layouts: extraction.report.layouts } : {}),
+      };
+      await writeFigmaReport(wsRoot.fsPath, merged);
+      await updateScaffoldState(wsRoot, (state) => ({
+        ...state,
+        figma: { ...saved, deliveryMode: extraction.deliveryMode, layoutExtractedAt: new Date().toISOString() },
+      }));
+
+      const dropped = extraction.report.summary?.layoutsDropped ?? 0;
+      const nodes = countLayoutNodes(merged.layouts);
+      if (nodes === 0) {
+        const why = extraction.report.summary?.layoutError;
+        vscode.window.showWarningMessage(
+          why
+            ? `No page structure could be read from Figma: ${why}`
+            : "No page structure was found. The artboards may be empty, or named differently than expected."
+        );
+        return;
+      }
+
+      const uri = vscode.Uri.joinPath(wsRoot, FIGMA_DESIGN_FILENAME);
+      await vscode.workspace.fs.writeFile(uri, Buffer.from(buildFigmaDesignContext(merged), "utf8"));
+      output.appendLine(
+        `[figma] Wrote ${FIGMA_DESIGN_FILENAME}: ${merged.layouts?.length ?? 0} artboard(s), ${nodes} layer(s), ` +
+        `${listUsedTokens(merged.layouts).length} token(s) referenced.`
+      );
+
+      vscode.window.showInformationMessage(
+        `Read ${nodes} layers from Figma into ${FIGMA_DESIGN_FILENAME}. Prompts will use it as the design guide.` +
+        (dropped > 0 ? ` ${dropped} artboard(s) were left out to fit Figma's response limit.` : "")
+      );
       await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(uri), { preview: false });
     })
   );

@@ -72,6 +72,9 @@ const EXTRACTOR_HEADER = `/* ---------------------------------------------------
 
 const EXTRACTOR_BODY = `
 async function extractFigmaTokens() {
+  const wantedLayouts = WANTED_LAYOUTS;
+  const includeTokens = INCLUDE_TOKENS;
+
   function toHex(color) {
     if (!color || typeof color !== 'object') { return null; }
     const to255 = (n) => Math.round((n ?? 0) * 255);
@@ -109,6 +112,10 @@ async function extractFigmaTokens() {
     frames: 0,
   };
   const collections = [];
+  // id -> name lookups, built as we go so the layout walk can name the token
+  // bound to a colour or a gap without spending another API call.
+  const varNames = {};
+  const styleNames = {};
 
   for (const c of await figma.variables.getLocalVariableCollectionsAsync()) {
     summary.totalCollections += 1;
@@ -118,6 +125,7 @@ async function extractFigmaTokens() {
       const v = await figma.variables.getVariableByIdAsync(id);
       if (!v) { continue; }
       summary.totalVariables += 1;
+      varNames[v.id] = v.name;
 
       const valuesByMode = [];
       for (const m of c.modes) {
@@ -136,13 +144,18 @@ async function extractFigmaTokens() {
     }
 
     // Emitted even when empty, so a missing collection is visible rather than
-    // silently absent from the report.
-    collections.push({ collection: c.name, modes: c.modes.map((m) => m.name), variables });
+    // silently absent from the report. Skipped entirely when only layouts are
+    // wanted: the variables were still read above, so the layout walk can
+    // still name the token bound to each colour and gap.
+    if (includeTokens) {
+      collections.push({ collection: c.name, modes: c.modes.map((m) => m.name), variables });
+    }
   }
 
   const textStyles = [];
   for (const s of await figma.getLocalTextStylesAsync()) {
     summary.textStyles += 1;
+    styleNames[s.id] = s.name;
     const style = {
       name: s.name,
       fontFamily: s.fontName && s.fontName.family,
@@ -156,7 +169,7 @@ async function extractFigmaTokens() {
     for (const k of Object.keys(style)) {
       if (style[k] === undefined) { delete style[k]; }
     }
-    textStyles.push(style);
+    if (includeTokens) { textStyles.push(style); }
   }
 
   // Top-level artboards, so the extension can suggest real breakpoints rather
@@ -164,6 +177,7 @@ async function extractFigmaTokens() {
   // are the point of this script, the payload rides back inside an error
   // message, and neither may be put at risk for advisory context.
   const frames = [];
+  const artboards = [];
   try {
     // Inside use_figma the property exists but calling it throws
     // '"loadAllPagesAsync" is not a supported API', so a typeof guard is not
@@ -175,6 +189,7 @@ async function extractFigmaTokens() {
     const isArtboard = (n) => n && (n.type === 'FRAME' || n.type === 'COMPONENT') && typeof n.width === 'number';
     const add = (n, pageName) => {
       frames.push({ name: n.name, width: Math.round(n.width), height: Math.round(n.height), page: pageName });
+      artboards.push({ node: n, page: pageName });
     };
     for (const page of figma.root.children) {
       for (const node of page.children) {
@@ -199,20 +214,156 @@ async function extractFigmaTokens() {
   }
   summary.frames = frames.length;
 
-  return { summary, collections, textStyles, frames };
+  const layouts = [];
+LAYOUT_BLOCK
+
+  // Measured: the error channel carrying this payload is cut at about 20KB,
+  // and a cut payload is worth nothing at all. Shedding whole artboards until
+  // it fits means a caller always gets valid JSON plus a count of what was
+  // dropped, rather than a truncated string and a wasted metered call.
+  const result = { summary, collections, textStyles, frames, layouts };
+  while (layouts.length > 0 && JSON.stringify(result).length > 18000) {
+    layouts.pop();
+    summary.layoutsDropped = (summary.layoutsDropped || 0) + 1;
+    summary.layouts = layouts.length;
+  }
+
+  return result;
 }
 
 const __lcPayload = SENTINEL_LITERAL + JSON.stringify(await extractFigmaTokens());
 `.trim();
 
 /**
+ * The structural walk of each artboard, spliced in only when asked for.
+ *
+ * Kept optional because it is by far the largest thing the script can produce,
+ * and the payload rides back inside an error message: a token import that
+ * works today must not start truncating because it now drags a layout tree
+ * along with it.
+ *
+ * Reuses the `varNames` and `styleNames` maps built during the token walk, so
+ * every colour and gap is reported as the token bound to it rather than as a
+ * raw value. That is what lets generated CSS reference the right variable
+ * instead of inventing a hex.
+ */
+const LAYOUT_WALK = `  try {
+    let budget = 400;
+    const SKIP = { VECTOR: 1, ELLIPSE: 1, LINE: 1, STAR: 1, POLYGON: 1, BOOLEAN_OPERATION: 1, SLICE: 1 };
+
+    const boundNames = (n) => {
+      const bv = n.boundVariables;
+      if (!bv) { return undefined; }
+      const out = {};
+      for (const key of Object.keys(bv)) {
+        const entry = Array.isArray(bv[key]) ? bv[key][0] : bv[key];
+        const name = entry && entry.id ? varNames[entry.id] : null;
+        if (name) { out[key] = name; }
+      }
+      return Object.keys(out).length ? out : undefined;
+    };
+
+    const describe = (n, depth) => {
+      if (budget <= 0 || depth > 8) { return null; }
+      if (n.visible === false || SKIP[n.type]) { return null; }
+      budget -= 1;
+
+      const d = { name: String(n.name).slice(0, 60), type: n.type };
+      if (typeof n.width === 'number') { d.width = Math.round(n.width); }
+      if (typeof n.height === 'number') { d.height = Math.round(n.height); }
+
+      if (n.layoutMode === 'HORIZONTAL' || n.layoutMode === 'VERTICAL') {
+        d.layout = n.layoutMode.toLowerCase();
+        if (n.itemSpacing) { d.gap = Math.round(n.itemSpacing); }
+        const pad = [n.paddingTop, n.paddingRight, n.paddingBottom, n.paddingLeft].map((p) => Math.round(p || 0));
+        if (pad.some((p) => p > 0)) { d.padding = pad; }
+        if (n.primaryAxisAlignItems && n.primaryAxisAlignItems !== 'MIN') { d.justify = n.primaryAxisAlignItems; }
+        if (n.counterAxisAlignItems && n.counterAxisAlignItems !== 'MIN') { d.align = n.counterAxisAlignItems; }
+      }
+
+      if (n.type === 'TEXT' && typeof n.characters === 'string') {
+        d.text = n.characters.replace(/\\s+/g, ' ').trim().slice(0, 120);
+        // Figma names a text layer after its own content, so the name is a
+        // prefix of the text. Repeating it cost ~9% of the payload.
+        if (d.text.indexOf(d.name) === 0) { delete d.name; }
+        // A text node's box is derived from its style and its container.
+        delete d.width;
+        delete d.height;
+      }
+      if (typeof n.textStyleId === 'string' && styleNames[n.textStyleId]) { d.style = styleNames[n.textStyleId]; }
+
+      const bound = boundNames(n);
+      if (bound) { d.bound = bound; }
+
+      // An instance is a reuse of a component: the component's name carries
+      // the meaning, and its internals would repeat for every instance.
+      if (n.type === 'INSTANCE') { return d; }
+
+      if (Array.isArray(n.children) && n.children.length > 0) {
+        const kids = [];
+        for (const c of n.children) {
+          const child = describe(c, depth + 1);
+          if (child) { kids.push(child); }
+          if (budget <= 0) { break; }
+        }
+        if (kids.length) {
+          d.children = kids;
+          // A container's height is whatever its contents come to; only a
+          // leaf (an image placeholder, a spacer) has a height worth stating.
+          delete d.height;
+        }
+      }
+      return d;
+    };
+
+    for (const a of artboards) {
+      if (wantedLayouts && wantedLayouts.indexOf(a.node.name) < 0) { continue; }
+      const root = describe(a.node, 0);
+      if (root) { layouts.push({ page: a.page, root: root }); }
+      if (budget <= 0) { summary.layoutTruncated = true; break; }
+    }
+  } catch (e) {
+    layouts.length = 0;
+    summary.layoutError = (e && e.message) ? e.message : String(e);
+  }
+  summary.layouts = layouts.length;`;
+
+export type ExtractorOptions = {
+  /** Capture a structural outline of each artboard as well as the tokens. */
+  includeLayouts?: boolean;
+  /**
+   * Include the full variable and text-style detail. Turn this off when the
+   * tokens are already cached and only layouts are wanted: at ~12.7KB it eats
+   * most of the ~20KB the payload channel allows, leaving no room for a
+   * layout tree. The variables are still read either way — the layout walk
+   * needs their names to report which token is bound where.
+   */
+  includeTokens?: boolean;
+  /**
+   * Artboards to walk, by name. Omit for all of them. Three breakpoints of
+   * one page mostly repeat each other, and the responsive differences are
+   * already captured in the variable modes, so one is usually enough.
+   */
+  layoutNames?: string[];
+};
+
+/**
  * Builds the extractor for one delivery mode.
  *
  * @param deliver `"return"` hands the payload back as the script's value;
  *   `"throw"` raises it as an Error, which every client surfaces verbatim.
+ * @param options What to capture, and how much of it.
  */
-export function buildExtractorScript(deliver: DeliveryMode): string {
-  const body = EXTRACTOR_BODY.replace("SENTINEL_LITERAL", JSON.stringify(SENTINEL));
+export function buildExtractorScript(deliver: DeliveryMode, options: ExtractorOptions = {}): string {
+  const wanted = options.layoutNames && options.layoutNames.length > 0
+    ? JSON.stringify(options.layoutNames)
+    : "null";
+
+  const body = EXTRACTOR_BODY
+    .replace("LAYOUT_BLOCK", options.includeLayouts ? LAYOUT_WALK : "")
+    .replace("WANTED_LAYOUTS", wanted)
+    .replace("INCLUDE_TOKENS", options.includeTokens === false ? "false" : "true")
+    .replace("SENTINEL_LITERAL", JSON.stringify(SENTINEL));
   const tail = deliver === "throw"
     ? "// Deliberate — see the header. This is how the results get back.\nthrow new Error(__lcPayload);"
     : "__lcPayload;";

@@ -80,11 +80,59 @@ export type FigmaFrameReport = {
   page?: string;
 };
 
-/** Optional self-reported counts, cross-checked against what we emit. */
+/**
+ * One node of an artboard's structure. `bound` names the design token applied
+ * to a property (`{ fills: "Surface", itemSpacing: "Space/Medium" }`), which is
+ * what lets generated CSS reference the right variable rather than a raw value.
+ */
+export type FigmaLayoutNode = {
+  /** Absent on text layers whose Figma name merely repeated their content. */
+  name?: string;
+  type: string;
+  width?: number;
+  height?: number;
+  /** Auto-layout direction, absent when the frame is freely positioned. */
+  layout?: string;
+  gap?: number;
+  /** `[top, right, bottom, left]`, omitted when all zero. */
+  padding?: number[];
+  justify?: string;
+  align?: string;
+  text?: string;
+  /** Applied text style name. */
+  style?: string;
+  /** Property name → bound variable name. */
+  bound?: Record<string, string>;
+  children?: FigmaLayoutNode[];
+};
+
+export type FigmaLayoutReport = {
+  page?: string;
+  root: FigmaLayoutNode;
+};
+
+/**
+ * What the extractor reported about its own run. The first three are
+ * cross-checked against what the emitter produces; the rest explain what the
+ * best-effort parts of the walk managed, so a thin result can be diagnosed
+ * from the cached JSON rather than by spending another metered call.
+ */
 export type FigmaReportSummary = {
   aliasModeValues?: number;
   literalModeValues?: number;
   textStyles?: number;
+  totalCollections?: number;
+  totalVariables?: number;
+  frames?: number;
+  /** Why the artboard scan found nothing, if it failed outright. */
+  frameError?: string;
+  layouts?: number;
+  /** Why the structural walk found nothing, if it failed outright. */
+  layoutError?: string;
+  /** Set when the node budget ran out mid-walk. */
+  layoutTruncated?: boolean;
+  /** Artboards shed to keep the payload inside the response limit. */
+  layoutsDropped?: number;
 };
 
 export type FigmaTokenReport = {
@@ -92,6 +140,8 @@ export type FigmaTokenReport = {
   textStyles?: FigmaTextStyleReport[];
   /** Advisory only; `emitTokensCss` ignores these. */
   frames?: FigmaFrameReport[];
+  /** Structural outline per artboard; `emitTokensCss` ignores these too. */
+  layouts?: FigmaLayoutReport[];
   summary?: FigmaReportSummary;
 };
 
@@ -300,10 +350,21 @@ export function parseFigmaTokenReport(raw: unknown): FigmaTokenReport {
       }))
     : [];
 
+  const layouts: FigmaLayoutReport[] = Array.isArray(raw.layouts)
+    ? raw.layouts
+      .filter(isRecord)
+      .filter((l) => isRecord(l.root) && typeof (l.root as any).name === "string")
+      .map((l) => ({
+        ...(typeof l.page === "string" ? { page: l.page } : {}),
+        root: l.root as FigmaLayoutNode,
+      }))
+    : [];
+
   return {
     collections,
     ...(textStyles.length > 0 ? { textStyles } : {}),
     ...(frames.length > 0 ? { frames } : {}),
+    ...(layouts.length > 0 ? { layouts } : {}),
     ...(isRecord(raw.summary) ? { summary: raw.summary as FigmaReportSummary } : {}),
   };
 }

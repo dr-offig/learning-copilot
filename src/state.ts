@@ -51,6 +51,8 @@ const STATE_VERSION = 1;
 export type FigmaImportState = {
   fileKey?: string;
   extractedAt?: string;
+  /** When the artboard structure was last imported; a separate metered call. */
+  layoutExtractedAt?: string;
   deliveryMode?: "return" | "throw";
   /** Mode chosen to occupy `:root`, per collection name. */
   baseModes?: Record<string, string>;
@@ -147,6 +149,7 @@ export function parseScaffoldState(raw: string): WorkspaceScaffoldState {
     const f = parsed.figma;
     if (typeof f.fileKey === "string") { state.figma.fileKey = f.fileKey; }
     if (typeof f.extractedAt === "string") { state.figma.extractedAt = f.extractedAt; }
+    if (typeof f.layoutExtractedAt === "string") { state.figma.layoutExtractedAt = f.layoutExtractedAt; }
     if (f.deliveryMode === "return" || f.deliveryMode === "throw") { state.figma.deliveryMode = f.deliveryMode; }
     if (f.baseModes && typeof f.baseModes === "object") {
       state.figma.baseModes = {};

@@ -101,6 +101,30 @@ converted are reported rather than skipped in silence — dangling aliases, alia
 loops (which would render the page unstyled with no browser error), and values
 that would break out of the stylesheet.
 
+## Figma Page Structure
+
+`Learning Copilot: Import Figma Page Structure` reads the layout of an artboard
+out of the Figma file and writes it to `FIGMA_DESIGN.md`: nesting, auto-layout
+direction, gaps, padding, alignment, the real text, and — the useful part —
+which design token is bound to each colour, gap and font size.
+
+```
+- FRAME "Hero" · vertical stack, padding 112 0, align center
+  · tokens: paddingTop=SectionPaddingVertical, fills=Primary
+  - TEXT "We make ideas unforgettable." · tokens: fills=Highlight on Primary, fontSize=Heading1Size
+```
+
+Prompts pick that file up automatically as the design guide, so a site can be
+generated from the design without analysing a screenshot. It is exact where an
+image analysis can only estimate — layer names, spacing and token references
+come from the file itself — and it costs no AI credits to produce. Analysing
+design images still works and still helps for visual character the structure
+cannot convey (photography, texture, mood); the two can be used together.
+
+It asks which artboard to read. One is usually enough: the breakpoints mostly
+repeat each other, and what differs between them is already in the token modes.
+`FIGMA_DESIGN.md` is plain markdown, so it can be read and edited by hand.
+
 **Importing is the metered step.** Figma counts MCP reads against the plan of
 the team that owns the file, not against your seat, so a file in your Drafts
 gets the Starter allowance of six calls a month even on a paid plan. The
@@ -147,6 +171,7 @@ in the Command Palette:
 - `Learning Copilot: Create or Update Project from Prompt`
 - `Learning Copilot: Analyze Design Files`
 - `Learning Copilot: Import Figma Tokens`
+- `Learning Copilot: Import Figma Page Structure`
 - `Learning Copilot: Open Learning Exercises`
 - `Learning Copilot: Compare Active File With Solution`
 - `Learning Copilot: Apply Solution For Task At Cursor`
@@ -199,9 +224,10 @@ arrows, and Return.
   - `state.json` — task solutions, hints, completion state, design analyses
   - `solutions/` — full solution copies of every scaffolded file
   - `answer-keys/` — the five most recent answer keys
-  - `figma-tokens.json` — the last imported Figma token report
+  - `figma-tokens.json` — the last imported Figma token report and page structure
 - CSS generated from Figma variables goes to `tokens.css` (see
   `learningCopilot.figmaTokensPath`).
+- The Figma page structure is written to `FIGMA_DESIGN.md` in your workspace.
 - Compare uses the solution snapshot and currently active file.
 
 Keeping state in the project means an exercise folder can be copied, renamed,

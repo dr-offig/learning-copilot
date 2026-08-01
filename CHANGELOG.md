@@ -15,6 +15,19 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
   override. Modes named Light and Dark become `prefers-color-scheme` queries;
   for anything else — breakpoints, brands, themes — you are asked once how the
   mode should apply, and the answer is remembered.
+- New **Import Figma Page Structure** command. It reads the layout of an
+  artboard straight out of Figma — nesting, auto-layout direction, spacing,
+  padding, alignment, the real text, and which design token is bound to each
+  colour, gap and font size — and writes it to `FIGMA_DESIGN.md`. Prompts then
+  use that as the design guide, so a site can be generated from the design
+  without analysing a single screenshot and without spending AI credits on
+  describing one. It is exact where an image analysis can only estimate:
+  layer names, spacing values and token references all come from the file
+  itself.
+- **Analyze Design Files** now asks which files to analyse when there is more
+  than one, with un-analysed files pre-selected. Analysing is the only part
+  that costs an AI call, so it should be a choice. (Image *assets* never cost
+  a call — their dimensions are read locally — and are unaffected.)
 - Breakpoints are suggested from the design rather than guessed. The import
   also reads the top-level artboard sizes, so a `Tablet` mode offers
   `max-width: 768px` because that is how wide the Tablet frame actually is.

@@ -9,4 +9,6 @@ node_modules
 # of whatever design system was last imported, so it is not ours to commit.
 report.json
 tokens.css
+probe.js
+tmp/
 .learning-copilot/

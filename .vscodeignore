@@ -13,11 +13,14 @@ esbuild.js
 **/*.map
 
 # --- Local working files ---
-# Figma imports and their generated CSS are per-project output, not something
-# to ship: report.json in particular is a dump of whatever design system was
-# last imported.
+# Figma imports and their generated output are per-project, not something to
+# ship: report.json and FIGMA_DESIGN.md are dumps of whatever design was last
+# imported while testing.
 report.json
 tokens.css
+probe.js
+FIGMA_DESIGN.md
+tmp/**
 .learning-copilot/**
 
 # --- Editor and test harness ---

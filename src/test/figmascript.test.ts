@@ -122,6 +122,108 @@ suite('figma extractor script', () => {
 	});
 });
 
+suite('figma layout capture', () => {
+	test('layouts are opt-in, so the working token import cannot start truncating', () => {
+		const withoutLayouts = buildExtractorScript('throw');
+		const withLayouts = buildExtractorScript('throw', { includeLayouts: true });
+
+		assert.ok(!withoutLayouts.includes('const describe ='), 'default must not walk the tree');
+		assert.ok(withLayouts.includes('const describe ='));
+		assert.ok(withLayouts.length > withoutLayouts.length);
+		// Both still declare `layouts`, so the report shape does not change.
+		assert.ok(withoutLayouts.includes('const layouts = []'));
+	});
+
+	test('the layout placeholder is always substituted', () => {
+		for (const opts of [{}, { includeLayouts: true }]) {
+			const script = buildExtractorScript('throw', opts);
+			assert.ok(!script.includes('LAYOUT_BLOCK'), `placeholder left in for ${JSON.stringify(opts)}`);
+		}
+	});
+
+	test('both variants parse as valid JavaScript', () => {
+		for (const opts of [{}, { includeLayouts: true }]) {
+			assert.doesNotThrow(
+				() => new Function('figma', `return (async () => {${buildExtractorScript('throw', opts)}})()`),
+				`should parse with ${JSON.stringify(opts)}`
+			);
+		}
+	});
+
+	test('the walk is bounded, because the payload rides back in an error string', () => {
+		const script = buildExtractorScript('throw', { includeLayouts: true });
+
+		assert.ok(script.includes('let budget = 400'));
+		assert.ok(script.includes('depth > 8'));
+		assert.ok(script.includes('summary.layoutTruncated'));
+		// Decorative geometry would multiply the node count for no benefit.
+		assert.ok(script.includes('VECTOR:'));
+		// A component instance repeats its whole internal tree per use.
+		assert.ok(/n\.type === 'INSTANCE'.*return d;/s.test(script));
+	});
+
+	test('the payload channel cap is respected by shedding artboards, not by truncating', () => {
+		const script = buildExtractorScript('throw', { includeLayouts: true });
+
+		// Measured against the real server: the error string carrying the
+		// payload is cut at about 20KB, and a cut payload is worth nothing —
+		// the whole metered call is wasted. Dropping whole artboards keeps the
+		// JSON valid and says how much went.
+		assert.ok(script.includes('JSON.stringify(result).length > 18000'));
+		assert.ok(script.includes('layouts.pop()'));
+		assert.ok(script.includes('summary.layoutsDropped'));
+	});
+
+	test('tokens can be left out when only layouts are wanted', () => {
+		const withTokens = buildExtractorScript('throw', { includeLayouts: true });
+		const withoutTokens = buildExtractorScript('throw', { includeLayouts: true, includeTokens: false });
+
+		assert.ok(withTokens.includes('const includeTokens = true'));
+		assert.ok(withoutTokens.includes('const includeTokens = false'));
+		// The variables are still read either way: the layout walk needs their
+		// names to report which token is bound where.
+		assert.ok(withoutTokens.includes('getLocalVariableCollectionsAsync'));
+		assert.ok(withoutTokens.includes('varNames[v.id] = v.name'));
+		assert.ok(withoutTokens.includes('if (includeTokens) {'));
+	});
+
+	test('artboards can be selected by name', () => {
+		const all = buildExtractorScript('throw', { includeLayouts: true });
+		const one = buildExtractorScript('throw', { includeLayouts: true, layoutNames: ['Desktop'] });
+
+		assert.ok(all.includes('const wantedLayouts = null'));
+		assert.ok(one.includes('const wantedLayouts = ["Desktop"]'));
+		assert.ok(one.includes('wantedLayouts.indexOf(a.node.name) < 0'));
+	});
+
+	test('text nodes do not repeat their own content as a name', () => {
+		const script = buildExtractorScript('throw', { includeLayouts: true });
+
+		// Figma names a text layer after its content; the duplication was ~9%
+		// of a payload that has no room to spare.
+		assert.ok(script.includes("d.text.indexOf(d.name) === 0"));
+		assert.ok(script.includes('delete d.name'));
+	});
+
+	test('a layout failure is recorded, not swallowed', () => {
+		const script = buildExtractorScript('throw', { includeLayouts: true });
+
+		assert.ok(script.includes('summary.layoutError'));
+		assert.ok(script.includes('layouts.length = 0'));
+	});
+
+	test('tokens are resolved by name from the maps the token walk already built', () => {
+		const script = buildExtractorScript('throw', { includeLayouts: true });
+
+		// Reusing these costs no extra API calls, and naming the token is what
+		// makes the outline more useful than a screenshot.
+		assert.ok(script.includes('varNames[v.id] = v.name'));
+		assert.ok(script.includes('styleNames[s.id] = s.name'));
+		assert.ok(script.includes('varNames[entry.id]'));
+		assert.ok(script.includes('styleNames[n.textStyleId]'));
+	});
+});
+
 suite('figma api probe', () => {
 	test('it parses as valid JavaScript', () => {
 		assert.doesNotThrow(() => new Function('figma', `return (async () => {${buildProbeScript()}})()`));
